@@ -1,5 +1,28 @@
 const fs = require("fs");
 const path = require("path");
+const { patchQuestionDetail } = require('./question-detail.cjs');
+
+// Apply before the legacy fence patch's already-installed early return.
+// Only marked office-fill detail lists acquire a collapsed position list.
+const questionClient = path.join(__dirname, 'node_modules', '@deepseek-ai',
+  'dsh-client-ui-user-questions', 'lib', 'client.js');
+if (!fs.existsSync(questionClient)) {
+  console.error('[question-detail] native question client not found:', questionClient);
+  process.exit(1);
+}
+try {
+  const current = fs.readFileSync(questionClient, 'utf8');
+  const patched = patchQuestionDetail(current);
+  if (patched !== current) {
+    const backup = questionClient + '.before-office-detail';
+    if (!fs.existsSync(backup)) fs.writeFileSync(backup, current);
+    fs.writeFileSync(questionClient, patched);
+    console.log('[question-detail] enabled collapsible fill locations');
+  }
+} catch (error) {
+  console.error('[question-detail] patch failed:', error.message);
+  process.exit(1);
+}
 
 const target = path.join(
   __dirname,

@@ -151,6 +151,11 @@ export function apply(ctx, config = {}) {
       targets: { type: 'array', items: { type: 'string' }, description: '要填写的目标模板路径；新建任务必填' },
       batch: { type: 'string', description: '通常省略，程序优先继续相同源文件和目标文件的原任务。仅用户明确指定业务批次时填写 YYYYMMDD-NN，不得自行编造日期或用任务描述代替批次。' },
       task_id: { type: 'string', description: '恢复已有任务时提供；工具会查状态并在需要时继续询问' },
+      mapping_read: { type: 'object', additionalProperties: false, properties: {
+        section: { type: 'string', enum: ['fields', 'templates', 'positions', 'current_positions', 'source_details', 'context', 'issues'] },
+        template: { type: 'string' }, offset: { type: 'integer' }, revision: { type: 'string' },
+        field: { type: 'string' }, slot_id: { type: 'string' },
+      }, description: '读取原任务的来源或位置页，必须同传task_id。续页原样传返回的next；按模板用section:positions和template。只读，不重新解析或弹窗。不能与rule_updates同传。' },
       rule_updates: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: {
           template: { type: 'string', required: true },
@@ -171,6 +176,9 @@ export function apply(ctx, config = {}) {
       }
       if (args.rule_updates && !args.task_id) {
         throw new Error('rule_updates 只能与 task_id 一起用于恢复 needs_mapping 任务');
+      }
+      if (args.mapping_read && (!args.task_id || args.rule_updates)) {
+        throw new Error('mapping_read 需要 task_id，且不能与 rule_updates 同传');
       }
       const work = await resolveWork(args.work, exec.agent?.session?.header?.cwd);
       return runOfficeFill({ ...args, work }, {

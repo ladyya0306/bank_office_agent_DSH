@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from . import doc_fill, doc_read, entity_key as EK, workroot as WR, xml_fill
+from .target_validation import target_structure_issue, value_target_issue
 from .common import (
     OfficeKitError,
     Result,
@@ -606,9 +607,12 @@ def extract_labels(path: Path, known_labels: set[str] | None = None) -> list[dic
                             continue
                         target = {"kind": "xlsx_cell", "sheet": ws.title,
                                   "cell": cell.coordinate, "anchor": anchor}
-                        # 无冒号标签使用右侧空单元格；合并标签从合并区域之后开始，
-                        # 绝不把值写回标签自身或同一合并区域。
-                        if m is None:
+                        # A standalone label (with or without its colon) uses
+                        # the formatted value cell to the right.  A sentence
+                        # that continues after the colon stays in the label
+                        # cell: its in-sentence blank is meaningful.
+                        standalone_label = (m is None or not text[m.end():].strip())
+                        if standalone_label:
                             merged_label = next((r for r in ws.merged_cells.ranges
                                                  if cell.coordinate in r), None)
                             start_col = (merged_label.max_col + 1
@@ -620,10 +624,14 @@ def extract_labels(path: Path, known_labels: set[str] | None = None) -> list[dic
                                     target["cell"] = candidate.coordinate
                                     target["anchor"] = None
                                     target["label_cell"] = cell.coordinate
-                                else:
+                                elif m is None:
+                                    # A colon-free label has no safe in-cell
+                                    # insertion point; retain the old rule that
+                                    # requires an explicit formatted value cell.
                                     continue
                             else:
-                                continue
+                                if m is None:
+                                    continue
                         labels.append({"text": label,
                                        "location": f"{ws.title}!{cell.coordinate}",
                                        "is_required": int(required), "target": target})
@@ -737,6 +745,56 @@ def extract_labels(path: Path, known_labels: set[str] | None = None) -> list[dic
     return found
 
 
+def _rule_targets(target: dict) -> list[dict]:
+    """Flatten one persisted rule without changing its stored history."""
+    if target.get("kind") == "multi":
+        return [item for item in target.get("targets", []) if isinstance(item, dict)]
+    return [target]
+
+
+def _target_key(target: dict) -> str:
+    return json.dumps(target, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _refresh_xlsx_value_cells(old_target: dict, discovered: list[dict]) -> tuple[list[dict], int]:
+    """Replace only a known stale label-cell target with its value cell.
+
+    ``discovered`` comes from the current template scan and contains
+    ``label_cell`` only when the right-hand cell is empty, styled and safe.
+    Thus this migration is deterministic; anything else remains untouched for
+    the normal local-issue workflow.
+    """
+    replacements = {(
+        target.get("sheet"), target.get("label_cell")): target
+        for target in discovered
+        if target.get("kind") == "xlsx_cell" and target.get("label_cell")
+    }
+    kept: list[dict] = []
+    migrated = 0
+    for old in _rule_targets(old_target):
+        key = (old.get("sheet"), old.get("cell"))
+        replacement = replacements.get(key)
+        if old.get("kind") == "xlsx_cell" and replacement is not None:
+            # A label-cell rule may be anchor based (old db-propose) or an
+            # exact blank span (old slot discovery).  In both forms its cell
+            # is the label cell, while the scan gives a concrete value cell.
+            kept.append(replacement)
+            migrated += 1
+        else:
+            kept.append(old)
+    if migrated:
+        # Older rules can contain both the label and its right-hand value cell.
+        # Once the label is migrated, retain that physical empty cell only once.
+        value_cells = {(t.get('sheet'), t.get('cell')): t for t in replacements.values()}
+        unique = {}
+        for target in kept:
+            if target.get('kind') == 'xlsx_cell':
+                target = value_cells.get((target.get('sheet'), target.get('cell')), target)
+            unique[_target_key(target)] = target
+        kept = list(unique.values())
+    return kept, migrated
+
+
 def cmd_db_propose(args) -> Result:
     """给每份模板的每个标签找最合适的字段，并按置信度分级。"""
     res = Result("db-propose")
@@ -751,6 +809,7 @@ def cmd_db_propose(args) -> Result:
     proposals: list[dict[str, Any]] = []
     auto = 0
     existing_kept = 0
+    refreshed_value_cells = 0
     reused_templates = 0
     for tpl_path in resolve_inputs(args.input):
         from .rule_pack import reuse_verified, suggest_similar
@@ -799,27 +858,52 @@ def cmd_db_propose(args) -> Result:
             proposals.append(entry)
 
         # One field can have several explicit locations (e.g. two worksheets).
-        # Keep one DB rule, enumerate its targets in the plan, and ask once with
-        # all locations listed. Never discard/replace a manually chosen target.
+        # Keep one DB rule and enumerate its targets in the plan.  When the
+        # current scan proves that an old XLSX label-cell target has a formatted
+        # value cell immediately to its right, migrate that one target in place.
+        # Other targets for the field remain untouched.
         for field in chosen_locations:
             items = [p for p in proposals if p['template'] == tpl_path.name and p['chosen'] == field]
             targets = list({json.dumps(p['target'], sort_keys=True): p['target'] for p in items}.values())
-            if len(targets) < 2:
-                continue
             old = original_rules.get(field)
-            if old and old.get('decided_by') != 'auto':
-                res.warn(f'{tpl_path.name}：{field} 有其他候选位置，保留原复核规则，请核对未覆盖位置。')
+            if not old:
+                # The first target was already written above.  Upgrade it to a
+                # multi-target rule only when this scan found more locations.
+                if len(targets) > 1:
+                    store.add_rule(tid, field, items[0]['label'],
+                                   {'kind': 'multi', 'targets': targets},
+                                   is_required=max(p['is_required'] for p in items),
+                                   confidence=min(p['confidence'] for p in items),
+                                   decided_by='auto', batch_no=batch_no)
                 continue
-            if old:
-                previous = old['target'].get('targets', [old['target']])
-                # Additional automatic locations must not replace an existing
-                # rule whose meaning no longer agrees with the current template.
-                if any(t not in targets for t in previous):
+            old_targets, migrated = _refresh_xlsx_value_cells(old['target'], targets)
+            if migrated:
+                # A reviewed rule may move only the target proven stale by the
+                # current template. Do not use this repair as permission to add
+                # unrelated newly scanned locations. The same narrow policy is
+                # used for automatic rules to avoid expanding an old mapping.
+                merged = old_targets
+            elif old.get('decided_by') != 'auto':
+                existing_kept += 1
+                continue
+            else:
+                # Preserve the former guard: an automatic rule is refreshed
+                # with additional scanned locations only if *all* of its old
+                # targets still appear in this template scan.
+                if any(_target_key(t) not in {_target_key(x) for x in targets}
+                       for t in old_targets):
+                    existing_kept += 1
                     continue
-            store.add_rule(tid, field, items[0]['label'], {'kind': 'multi', 'targets': targets},
-                           is_required=max(p['is_required'] for p in items),
+                merged = targets
+            if not migrated and len(merged) == len(old_targets):
+                continue
+            packed = merged[0] if len(merged) == 1 else {'kind': 'multi', 'targets': merged}
+            store.add_rule(tid, field, items[0]['label'], packed,
+                           is_required=max([int((old or {}).get('is_required', 0))] +
+                                           [p['is_required'] for p in items]),
                            confidence=min(p['confidence'] for p in items),
-                           decided_by='auto', batch_no=batch_no)
+                           decided_by=(old.get('decided_by') if old else 'auto'), batch_no=batch_no)
+            refreshed_value_cells += migrated
 
     out = _rdir(args, "db-propose", batch_no)
     p = out / "proposals.json"
@@ -830,6 +914,7 @@ def cmd_db_propose(args) -> Result:
     no_candidate = [x for x in proposals if not x["candidates"]]
     res.data.update({"batch_no": batch_no, "labels": len(proposals), "auto_rules": auto,
                      "existing_rules_kept": existing_kept,
+                     "refreshed_xlsx_value_cells": refreshed_value_cells,
                      "reused_verified_templates": reused_templates,
                      "needs_model_arbitration": len(needs_model),
                      "no_candidate": len(no_candidate), "proposals": proposals,
@@ -1061,6 +1146,12 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
             tied = _tied_candidates(rule.get("label") or field, facts, field)
             ambiguous = bool(meta is not None and meta.get("_ambiguous"))
             cands = (meta or {}).get("_candidates") or []
+            # Shape/unit incompatibility is local to this destination.  Keep
+            # every other target in the batch flowing; this row can be blanked
+            # or corrected with --new after the preview explains the problem.
+            local_issue = target_structure_issue(tpl, rule["target"])
+            if local_issue is None and value is not None and str(value).strip():
+                local_issue = value_target_issue(tpl, rule["target"], str(value))
             if ambiguous:
                 # 🔴 库里这个键**属于多个主体**，而字段名又没指明是谁的 —— **不许替你挑**
                 who = "、".join("%s（%s）" % (c["entity_name"], c["value"]) for c in cands[:3])
@@ -1069,6 +1160,8 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
                     "请用 `--use <本表编号>=<主体名或#编号>` 指明" % (len(cands), who))
             elif value is None or not str(value).strip():
                 decision, ask = "empty", "源文件里没有这个值（缺失留空）"
+            elif local_issue:
+                decision, ask = "ask", "填写位置与值的单位/类型不兼容：%s；可留空，或输入符合该位置的值" % local_issue
             elif role_blocked:
                 decision, ask = "ask", "这个主体的角色还没确认（🟡 提示级）"
             elif tied:
@@ -1097,6 +1190,7 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
                 "subject_eid": subject_eid, "subject_label": subject_label,
                 "subject_scope": subject_scope, "subject_note": subject_note,
                 "qualified_source": bool((meta or {}).get('_qualified')),
+                "local_issue": local_issue,
                 "relation_owner_eid": (meta or {}).get('_relation_owner_eid'),
                 "structure_ok": struct_ok, "structure_note": struct_note, "doc_kind": kind,
                 "already_filled": _already_filled(store, field, batch_no),
@@ -1351,6 +1445,10 @@ def _guard_fill(plan: dict, selection: dict) -> tuple[list[dict], list[dict]]:
     for n in sorted(todo):
         r = slots[n]
         act = todo[n]
+        if act["action"] == "accept" and r.get("local_issue"):
+            problems.append({"n": n, "why": "不能直接接受原建议：" + r["local_issue"]
+                                            + "；请留空，或用 --new 输入符合该位置的值"})
+            continue
         if act["action"] in ("accept", "new") and r["decision"] == "empty" \
                 and act["action"] != "new":
             problems.append({"n": n, "why": "源文件里没有这个值，选不了「接受」——"

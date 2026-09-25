@@ -937,6 +937,11 @@ def _apply_anchor(document, spec: dict[str, Any], fields, new_value: str):
     if len(hits) > max_matches:
         return [h[0] for h in hits], "ambiguous"
     for loc, par, s, e in hits:
+        # Keep the fallback python-docx writer subject to the same unit/type
+        # guard as XmlEngine.  Otherwise an XML-engine fallback could append a
+        # date range directly before a printed "年".
+        from .value_fit import fit_value
+        new_value = fit_value(paragraph_text(par), s, e, new_value)
         if e <= s:
             # Empty span: insert at the anchor point.
             replace_in_paragraph(par, s, s, new_value)

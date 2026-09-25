@@ -10,12 +10,12 @@ from office_kit.store_v2 import StoreV2, allocate_batch, sha256_file, valid_batc
 from office_kit.workroot import init_workroot, is_workroot
 from office_kit.cli import build_parser, _dispatch
 from office_kit.harness import build_fill_plan, current_docx_target_errors, current_xlsx_gaps
-from . import storage as state, source, review, mapping
+from . import storage as state, source, review, mapping, mapping_view, timing
 
 ROOT = Path(__file__).resolve().parents[1]
 WorkflowError = ValueError
-POSITION_PARSE_VERSION = 4
-SUBJECT_PLAN_VERSION = 3
+POSITION_PARSE_VERSION = 5
+SUBJECT_PLAN_VERSION = 4
 
 
 def command(argv):
@@ -34,27 +34,58 @@ def response(work, task):
         if record.get('output') and record.get('status') == 'completed':
             result['output'] = str(work / record['output'])
         results.append(result)
-    return {'ok': task['status'] != 'failed', 'status': task['status'], 'task_id': task['id'],
+    needs_mapping = task['status'] == 'needs_mapping'
+    if needs_mapping:
+        # Detailed errors and rules remain readable through mapping_read, once only.
+        for item in results:
+            if item.get('error'):
+                item['error'] = '待整理位置；原因见 mapping_read 的 issues 页'
+            item.pop('blank_slots', None)
+        results = results[:20]
+    issues = task.get('issues', [])
+    if needs_mapping and mapping_view.size(issues) > 1800:
+        issues = [{'count': len(issues), 'read': {'section': 'issues'}, 'note': '完整问题按页读取'}]
+    result = {'ok': task['status'] != 'failed', 'status': task['status'], 'task_id': task['id'],
             'work': str(work), 'batch': task['batch'], 'questions': task.get('questions', []),
-            'issues': task.get('issues', []), 'results': results, 'counters': task['counts'],
-            'report': str(work / task['report']) if task.get('report') else None,
-            'mapping_requests': [{'template': name, 'positions': [mapping.visible_slot(s) for s in record.get('unmapped_slots', [])],
-                                  'current_positions': record.get('current_positions', [])}
-                                 for name, record in task['documents'].items() if record.get('status') == 'needs_mapping'],
-            'available_fields': task.get('available_fields', []) if any(
-                r.get('status') == 'needs_mapping' for r in task['documents'].values()) else [],
-            'mapping_revision': state.digest([[name, r.get('current_positions'), r.get('blank_slots')]
-                                              for name, r in task['documents'].items()]),
+            'issues': issues, 'results': results, 'counters': task['counts'],
+            'timing': timing.summary(task),
+            'report': str(work / task['report']) if task.get('report') and task['status'] in ('completed', 'partial') else None,
+            'mapping_requests': [], 'available_fields': [],
+            'mapping_revision': mapping_view.revision(task),
             'unsigned': True, 'note': ('部分源材料尚未解析，请查看 issues 中的文件和原文；已生成文件仅包含已处理内容。'
                                      if task.get('source_issues') else '')
                                     + '填报完成的文件供用户复核；未代用户签核。'}
+    if needs_mapping:
+        result.update(mapping_view.initial(task))
+    if task.get('delivery') and not needs_mapping:
+        result['delivery'] = task['delivery']
+    return result
+
+
+def preserve_output(record):
+    if not record.get('output'):
+        return
+    history = record.setdefault('output_history', [])
+    if not any(item.get('output') == record['output'] for item in history):
+        history.append({key: record.get(key) for key in ('output', 'output_hash', 'run_id')})
+
+
+def refresh_delivery(store, work, task):
+    from .delivery import build_delivery
+    artifacts = [dict(r) for r in store.conn.execute(
+        "SELECT a.*,t.path AS template_path,t.name AS template_name FROM fill_op a "
+        "LEFT JOIN template t ON t.id=a.template_id WHERE a.kind='artifact' AND a.batch_no=? ORDER BY a.id",
+        (task['batch'],))]
+    report = work / 'out' / task['batch'] / '_报告' / f"toolV2-{task['id']}-全部文件.md"
+    task['delivery'] = build_delivery(task, artifacts, str(report) if task['status'] in ('completed', 'partial') else None)
 
 
 def rebase(store, work, task):
     old = task.get('last_work')
     if not old or old == str(work):
         return
-    for table, column in [('template', 'path'), ('source', 'path'), ('source', 'copy_path')]:
+    for table, column in [('template', 'path'), ('source', 'path'), ('source', 'copy_path'),
+                          ('fill_op', 'artifact_path')]:
         for row in list(store.conn.execute(f'SELECT id,{column} FROM {table}')):
             try:
                 relative = Path(row[1]).relative_to(old)
@@ -163,6 +194,7 @@ def prepare_documents(store, work, task):
                                           'count': len(uncovered)}]
             record['plan'] = plan
             if errors:
+                preserve_output(record)
                 record.update(status='needs_mapping', error=errors)
                 task['issues'].append({'template': name, 'problems': errors,
                                       'current_positions': [{'field': r['field'], 'target': r['target']}
@@ -181,17 +213,20 @@ def prepare_documents(store, work, task):
                 if prior.get('status') == 'completed' and prior.get('signature') == signature and output.is_file() and sha256_file(output) == prior.get('output_hash'):
                     record['status'] = 'completed'
                 else:
+                    preserve_output(record)
                     record['status'] = 'pending'
                     record.pop('error', None)
                 record['signature'] = signature
         except Exception as exc:
+            preserve_output(record)
             record.update(status='needs_mapping', error=str(exc))
             task['issues'].append({'template': name, 'reason': str(exc)})
         task['documents'][name] = record
 
 
 def advance(store, work, task, *, execute=True):
-    questions = source.prepare(store, work, task)
+    with timing.measure(task, 'source_parse_and_check'):
+        questions = source.prepare(store, work, task)
     if questions:
         task.update(status='awaiting_source', questions=questions)
         save(store, task)
@@ -201,9 +236,11 @@ def advance(store, work, task, *, execute=True):
         save(store, task)
         return
     if not task.get('source_ready'):
-        source.ingest(store, work, task)
+        with timing.measure(task, 'source_ingest'):
+            source.ingest(store, work, task)
         save(store, task)
-    prepare_documents(store, work, task)
+    with timing.measure(task, 'position_plan_and_check'):
+        prepare_documents(store, work, task)
     if any(r.get('status') == 'needs_mapping' for r in task['documents'].values()):
         task.update(status='needs_mapping', questions=[])
         save(store, task)
@@ -212,7 +249,8 @@ def advance(store, work, task, *, execute=True):
     if task['questions']:
         task['status'] = 'awaiting_fill'
     elif execute:
-        execute_documents(store, work, task)
+        with timing.measure(task, 'generation_and_check'):
+            execute_documents(store, work, task)
     save(store, task)
 
 
@@ -224,7 +262,9 @@ def execute_documents(store, work, task):
         if record['status'] != 'pending':
             continue
         plan = record['plan']
+        preserve_output(record)
         plan['run_id'] = f"{task['batch']}-V2-{uuid.uuid4().hex[:12]}"
+        record['run_id'] = plan['run_id']
         p = work / 'work' / task['batch'] / f"v2-{task['id']}-{state.digest(name)[:12]}.json"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(plan, ensure_ascii=False), encoding='utf-8')
@@ -279,6 +319,7 @@ def execute_documents(store, work, task):
     if task['status'] == 'completed' and task.get('source_issues'):
         task['status'] = 'partial'
     task['questions'] = []
+    refresh_delivery(store, work, task)
     from .report import write
     write(work, task)
 
@@ -322,16 +363,26 @@ def dispatch(data):
         state.initialise(store.conn)
         action = data.get('action')
         task = None
+        started = None
         try:
             if action == 'start':
                 task = start(store, work, data)
+                started = timing.begin(task)
                 advance(store, work, task)
             else:
                 task = state.get(store.conn, 'office_v2_task', data.get('task_id', ''))
                 if task is None:
                     raise ValueError('找不到该任务')
                 rebase(store, work, task)
-                if action == 'update_positions':
+                if action == 'read_mapping':
+                    return {'ok': True, 'status': task['status'], 'task_id': task['id'],
+                            'work': str(work), 'batch': task['batch'],
+                            'mapping_page': mapping_view.page(task, data.get('mapping_read') or {}),
+                            'counters': task['counts']}
+                started = timing.begin(task, data.get('user_wait'))
+                if action == 'record_wait':
+                    pass
+                elif action == 'update_positions':
                     update_positions(store, work, task, data.get('updates'))
                 elif action in ('status', 'resume'):
                     previous_questions = task.get('questions', [])
@@ -345,16 +396,28 @@ def dispatch(data):
                             review.save(task, data['answers'])
                         advance(store, work, task)
                     elif action == 'status' and not task.get('questions'):
-                        execute_documents(store, work, task)
+                        with timing.measure(task, 'generation_and_check'):
+                            execute_documents(store, work, task)
                     save(store, task)
                 else:
                     raise ValueError('不支持的任务操作')
         except Exception as exc:
             if task is None:
                 raise
-            result = response(work, task)
+            if started is not None:
+                timing.end(task, started)
+                save(store, task)
+            result = ({'task_id': task['id'], 'work': str(work), 'batch': task['batch']}
+                      if action == 'read_mapping' else response(work, task))
             result.update(ok=False, status='failed', questions=[], error=str(exc),
                           resume_status=task.get('status'),
                           recovery='修复后使用此 task_id 恢复原任务；已入库答案保留，不要更换批次或拆成新任务。')
             return result
+        if started is not None:
+            timing.end(task, started)
+            refresh_delivery(store, work, task)
+            if task['status'] in ('completed', 'partial'):
+                from .report import write
+                write(work, task)
+            save(store, task)
         return response(work, task)

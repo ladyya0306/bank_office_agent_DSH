@@ -30,15 +30,24 @@ try {
       return {answers: questions.map(q => ({id:q.id, selected:[q.options[0].label], custom:''}))};
     },
   };
+  const cancelled = await runOfficeFill(args, { ...ports, ask: async () => {
+    await new Promise(resolve => setTimeout(resolve, 20));
+    return { cancelled: true };
+  } });
+  assert.equal(cancelled.status, 'cancelled');
   const first = await runOfficeFill(args, ports);
   assert.equal(first.status, 'completed', JSON.stringify(first));
   assert.equal(first.results.length, 1);
   assert.ok(cards > 0);
+  assert.equal(first.timing.cancelled_waits, 1);
+  assert.equal(first.timing.stages.user_confirmation_wait.count, 3);
+  assert.ok(first.timing.stages.user_confirmation_wait.seconds >= 0.02);
   const originalCards = cards;
   const second = await runOfficeFill({work, task_id: first.task_id}, ports);
   assert.equal(second.status, 'completed');
   assert.equal(cards, originalCards, 'Unchanged task asked again');
   assert.equal(second.counters.fill_processes, first.counters.fill_processes);
+  assert.deepEqual(second.timing.stages.user_confirmation_wait, first.timing.stages.user_confirmation_wait);
   const changed = spawnSync(python, ['-', work], {encoding:'utf8', windowsHide:true,
     env:{...process.env, PYTHONUTF8:'1'}, input:[
       'import sys', 'from pathlib import Path', 'from docx import Document',
@@ -58,7 +67,8 @@ try {
   assert.ok(readBack.stdout.includes('987654321'));
   console.log(JSON.stringify({passed: true, nativeAskInterfaceSimulated: true,
     pythonWorkerReal: true, firstQuestions: originalCards, resumeQuestions: 0,
-    changedSourceQuestions: cards-originalCards, sameBatchNewValueVerified:true}));
+    changedSourceQuestions: cards-originalCards, sameBatchNewValueVerified:true,
+    cancelledWaitRecorded: true, resumedWaitNotDoubleCounted: true}));
 } finally {
   assert.ok(path.dirname(work) === os.tmpdir() && path.basename(work).startsWith('office-v2-integration-'));
   await rm(work, {recursive: true, force: true});

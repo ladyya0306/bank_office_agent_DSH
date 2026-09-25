@@ -266,7 +266,23 @@ def _xlsx_slots(path: Path) -> list[dict[str, Any]]:
                                         "target": target, "protected": protected, "protected_reason": reason})
     finally:
         book.close()
-    return results
+    # A compact label cell sometimes has both an old in-cell insertion rule and
+    # the actual formatted value cell to its right.  Prefer the value cell, but
+    # preserve a real sentence blank such as ``金额（____）万元``: it has text
+    # after the blank and therefore is not merely a label/value-table layout.
+    adjacent = {(x["target"].get("sheet"), x["target"].get("label_cell"))
+                for x in results if x["target"].get("kind") == "xlsx_cell"
+                and x["target"].get("label_cell")}
+    filtered: list[dict[str, Any]] = []
+    for slot in results:
+        target = slot["target"]
+        if (target.get("kind") == "xlsx_cell" and "expected_text" in target
+                and (target.get("sheet"), target.get("cell")) in adjacent):
+            raw = str(target["expected_text"])
+            if not raw[target["span_end"]:].strip():
+                continue
+        filtered.append(slot)
+    return filtered
 
 
 def discover_slots(path: Path | str) -> list[dict[str, Any]]:

@@ -35,6 +35,7 @@
 !/deepseek-harness-local/package-lock.json
 !/deepseek-harness-local/start.js
 !/deepseek-harness-local/patch-fence.cjs
+!/deepseek-harness-local/question-detail.cjs
 !/deepseek-harness-local/tool-v2-startup.cjs
 !/deepseek-harness-local/tests/
 !/deepseek-harness-local/workspace/

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const mappingRevisions = new Map();
 
@@ -77,6 +77,11 @@ function addTaskId(error, taskId) {
 
 /** Drive only the fixed office.py JSON protocol; all effects are injected for testing. */
 export async function runOfficeFill(args, { ask, run, signal }) {
+  if (args.mapping_read) {
+    if (!args.task_id || args.rule_updates) throw new Error('mapping_read 需要 task_id，且不能与 rule_updates 同传');
+    return validateEnvelope(await run({ action: 'read_mapping', work: args.work,
+      task_id: args.task_id, mapping_read: args.mapping_read }, { signal }));
+  }
   let response;
   try {
     response = preserveTaskContext(validateEnvelope(args.task_id
@@ -124,26 +129,40 @@ export async function runOfficeFill(args, { ask, run, signal }) {
     }
 
     let askResult;
+    const waitId = randomUUID();
+    const waitStarted = performance.now();
+    const waitStartedAt = Date.now() / 1000;
+    const waitEvent = (outcome) => ({ id: waitId,
+      milliseconds: Math.max(0, performance.now() - waitStarted), outcome,
+      started_at: waitStartedAt, ended_at: Date.now() / 1000 });
+    const cancelled = async () => {
+      let timingRecorded = true;
+      try {
+        await run({ action: 'record_wait', work: response.work || args.work,
+          task_id: response.task_id, user_wait: waitEvent('cancelled') }, { timeoutMs: 5000 });
+      } catch { timingRecorded = false; }
+      return { ok: true, status: 'cancelled', task_id: response.task_id,
+        work: response.work, batch: response.batch,
+        ...(!timingRecorded ? { timing_note: '取消等待时长未保存；恢复时该区间标为未细分。' } : {}) };
+    };
     try {
       askResult = await ask({ questions: response.questions, signal });
     } catch (error) {
       if (signal?.aborted || error?.name === 'AbortError'
           || error?.message === 'the user cancelled ask_user_question') {
-        return { ok: true, status: 'cancelled', task_id: response.task_id,
-          work: response.work, batch: response.batch };
+        return cancelled();
       }
       throw addTaskId(error, response.task_id);
     }
     let answers;
     try { answers = answersFromAsk(response, askResult); }
     catch (error) { throw addTaskId(error, response.task_id); }
-    if (!answers) return { ok: true, status: 'cancelled', task_id: response.task_id,
-      work: response.work, batch: response.batch };
+    if (!answers) return cancelled();
 
     try {
       const previous = response;
       response = preserveTaskContext(validateEnvelope(await run({ action: 'resume', work: previous.work || args.work,
-        task_id: previous.task_id, answers }, { signal })), previous);
+        task_id: previous.task_id, answers, user_wait: waitEvent('answered') }, { signal })), previous);
     } catch (error) {
       if (signal?.aborted) return { ok: true, status: 'cancelled', task_id: response.task_id,
         work: response.work, batch: response.batch };

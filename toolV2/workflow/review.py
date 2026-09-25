@@ -1,9 +1,49 @@
 """Reuse saved fill answers and group identical questions across documents."""
 from office_kit.fill_decisions import fingerprint, saved_choices, save_choices
 from .storage import digest
+from pathlib import Path
 
 ACCEPT = '采用建议值（推荐）'
 BLANK = '留空'
+
+
+def _fact_catalog(task):
+    """Read the current batch's existing facts so aliases can share review cards."""
+    db = next((r.get('plan', {}).get('db_path') for r in task.get('documents', {}).values()
+               if r.get('plan', {}).get('db_path')), None)
+    if not db or not Path(db).is_file():
+        return {}
+    from office_kit.store_v2 import StoreV2
+    from .mapping import fact_catalog
+    with StoreV2(db, actor='workflow-review', create=False) as store:
+        store.batch_scope = task['batch']
+        return fact_catalog(store)
+
+
+def _purpose(row, meta):
+    # Qualified aliases preserve the original fact key here. This prevents one
+    # value (for example a representative's name) being merged across distinct
+    # legal purposes just because it belongs to the same person.
+    return meta.get('_base_field') or row.get('field')
+
+
+def _fact_identity(row, meta):
+    if row.get('ambiguous'):
+        candidates = meta.get('_candidates') or row.get('candidates') or []
+        fact_ids = sorted(c.get('fact_id', c.get('id')) for c in candidates
+                          if c.get('fact_id', c.get('id')) is not None)
+        return ('ambiguous', tuple(fact_ids)) if fact_ids else None
+    fact_id = meta.get('fact_id', meta.get('id'))
+    if fact_id is None and not row.get('ambiguous') and row.get('entity_id') is not None:
+        # A global catalog key can be ambiguous although this template has an
+        # explicitly resolved subject. Match the exact stored evidence only.
+        matches = [c for c in meta.get('_candidates', [])
+                   if c.get('entity_id') == row.get('entity_id')
+                   and str(c.get('value')) == str(row.get('value'))
+                   and c.get('provenance') == row.get('provenance')]
+        if len(matches) == 1:
+            fact_id = matches[0].get('fact_id', matches[0].get('id'))
+    return ('fact', fact_id) if fact_id is not None else None
 
 
 def location(place):
@@ -31,6 +71,7 @@ def location(place):
 
 def questions(task):
     groups = {}
+    catalog = _fact_catalog(task)
     for template, record in task['documents'].items():
         if record.get('status') in ('completed', 'needs_mapping') or not record.get('plan'):
             continue
@@ -41,10 +82,26 @@ def questions(task):
                 continue
             # Unresolved owners cannot share an answer merely because their
             # candidate lists happen to be identical.
-            owner = row.get('subject_eid') or row.get('entity_id')
-            scope = [row.get('subject_scope'), owner if owner is not None else template]
-            key = digest([scope, row['field'], row.get('value'), row.get('entity_name'),
-                          row.get('ambiguous'), row.get('candidates'), row.get('provenance')])
+            relation_owner = row.get('relation_owner_eid')
+            owner = relation_owner or row.get('subject_eid') or row.get('entity_id')
+            meta = catalog.get(row['field'], {})
+            fact_identity = _fact_identity(row, meta)
+            isolate = owner is None and (row.get('ambiguous') or fact_identity is None)
+            # A resolved owner is the canonical scope: subject_scope can vary
+            # between a raw field and its qualified alias for that same owner.
+            # Relation ownership remains part of the key to separate one person
+            # acting for different companies.
+            scope = ([owner] if owner is not None else
+                     [row.get('subject_scope'), template if isolate else None])
+            # Without a stable source fact identity, keep the previous exact
+            # field/provenance grouping. Never infer aliases from equal values.
+            source_identity = (fact_identity if fact_identity else
+                               ('legacy', row['field'], row.get('provenance')))
+            local_issue = row.get('local_issue')
+            key = digest([task['batch'], scope, source_identity, _purpose(row, meta),
+                          row.get('value'), row.get('entity_name'), row.get('source_kind'),
+                          row.get('ambiguous'), row.get('candidates'), local_issue,
+                          (template, row.get('n')) if local_issue else None])
             group = groups.setdefault(key, {'row': row, 'places': []})
             group['places'].append({'template': template, 'n': row['n'],
                                     'fingerprint': fingerprint(plan, row), 'target': row['target'],
@@ -54,7 +111,9 @@ def questions(task):
     for group in groups.values():
         row = group['row']
         qid = 'fill-' + digest([task['batch'], group['places']])
-        if row.get('ambiguous'):
+        if row.get('local_issue'):
+            options = []
+        elif row.get('ambiguous'):
             options = [{'label': f"使用主体 #{c['entity_id']} {c['entity_name']}",
                         'description': f"值：{c['value']}"} for c in row.get('candidates', [])]
         elif row.get('value') not in (None, ''):
@@ -62,15 +121,23 @@ def questions(task):
         else:
             options = []
         options.append({'label': BLANK, 'description': '本卡列出的位置全部留空。'})
-        places = '；'.join(location(p) for p in group['places'])
-        if row.get('ambiguous'):
+        places = [location(p) for p in group['places']]
+        if row.get('local_issue'):
+            suggestion = f"建议留空：{row.get('local_issue')}"
+        elif row.get('ambiguous'):
             suggestion = '源材料中有多个主体的值，请选择本表要使用的那一项，并非资料缺失'
         elif row.get('value') not in (None, ''):
             suggestion = f"建议填写：{row['value']}（来源主体：{row.get('entity_name') or '业务公共信息'}）"
         else:
             suggestion = f"未找到{row.get('subject_label') or '本表对应主体'}的这项信息，可留空"
-        output.append({'id': qid, 'header': row['field'],
-                       'question': f"填写位置：{places}。{suggestion}。自定义回答请直接填写要放入这些位置的文字；不同位置需不同内容时，请勿合写为一句说明。",
+        risk = '【重要信息】' if row.get('high_risk') else ''
+        output.append({'id': qid, 'header': risk + row['field'],
+                       'question': suggestion,
+                       'detail': '<!--dsh-fill-locations:v1-->\n填写位置（%d 处）：\n\n%s\n\n自定义回答请填写要放入这些位置的文字。' %
+                                 (len(places), '\n'.join(f'- {place}' for place in places)),
+                       'suggestion': suggestion,
+                       'locations': places,
+                       'risk': row.get('high_risk'),
                        'options': options})
         task['question_groups'][qid] = group
     return output

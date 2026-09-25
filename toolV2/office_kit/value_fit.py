@@ -12,9 +12,28 @@ from .common import OfficeKitError
 
 _PRINTED_ENDINGS = ("有限公司", "万元", "人民币", "公司", "元", "年", "号")
 _YUAN_AMOUNT = re.compile(r"(?:人民币\s*)?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?\s*(?:万|亿)?")
+_DATE_PART = r"\d{4}(?:\s*年(?:\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日?)?)?|[-./]\d{1,2}(?:[-./]\d{1,2})?)?"
+_DATE_RANGE = re.compile(_DATE_PART + r"\s*起?\s*(?:至|到|[-—–~～]+)\s*" + _DATE_PART)
+
+
+def value_fit_issue(text: str, start: int, end: int, source_value: str) -> str | None:
+    """Return a local, explainable incompatibility without changing a template.
+
+    A date range cannot be one component before a printed year/month unit.
+    It may be a duration count or calendar component; neither accepts a range.
+    """
+    right = text[end:].lstrip()
+    value = str(source_value).strip()
+    if right.startswith(("年", "个月", "月")) and _DATE_RANGE.search(value):
+        unit = "年" if right.startswith("年") else ("个月" if right.startswith("个月") else "月")
+        return "模板此处固定印有“%s”，需要期限数量；来源值是日期区间，不能直接填写" % unit
+    return None
 
 
 def fit_value(text: str, start: int, end: int, source_value: str) -> str:
+    issue = value_fit_issue(text, start, end, source_value)
+    if issue:
+        raise OfficeKitError(issue)
     value = str(source_value)
     left = text[:start].rstrip()
     right = text[end:].lstrip()

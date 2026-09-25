@@ -35,8 +35,9 @@ class MultipleLocationTests(unittest.TestCase):
                     break
                 if r['status'] == 'awaiting_fill':
                     fill_questions += len(r['questions'])
-                    self.assertIn('第二张', r['questions'][0]['question'])
-                    self.assertIn('第 2 行', r['questions'][0]['question'])
+                    rendered = r['questions'][0]['question'] + '\n' + r['questions'][0].get('detail', '')
+                    self.assertIn('第二张', rendered)
+                    self.assertIn('第 2 行', rendered)
                 r = request(dict(action='resume', work=str(work), task_id=r['task_id'],
                                  answers=[dict(id=q['id'], selected=[q['options'][0]['label']], custom='')
                                           for q in r['questions']]))

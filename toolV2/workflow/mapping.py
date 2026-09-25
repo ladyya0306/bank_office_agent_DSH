@@ -6,7 +6,7 @@ from office_kit.harness import candidates_for
 from office_kit.template_slots import discover_slots
 from office_kit.target_validation import validate_target
 
-SLOT_DISCOVERY_VERSION = 1
+SLOT_DISCOVERY_VERSION = 2
 
 
 def contains(outer, inner):
@@ -86,7 +86,9 @@ def inspect(store, path, record, facts):
 
 def visible_facts(facts):
     return [{'field': key, 'value': meta.get('value'), 'entity': meta.get('entity_name'),
-             'source': meta.get('provenance'), 'candidates': meta.get('_candidates', [])}
+             'source': meta.get('provenance'), 'fact_id': meta.get('fact_id', meta.get('id')),
+             'entity_id': meta.get('entity_id'),
+             'candidates': meta.get('_candidates', [])}
             for key, meta in facts.items()]
 
 
@@ -102,7 +104,8 @@ def visible_slot(slot):
             'context': {key: value[:360] for key, value in context.items()},
             'target': {key: value for key, value in target.items() if key != 'expected_text'},
             'candidates': [{'field': c['field'], 'score': c['score']}
-                           for c in slot.get('candidates', [])[:3]]}
+                           for c in slot.get('candidates', [])[:3]],
+            'full_context': {'section': 'context', 'slot_id': slot['id']}}
 
 
 def auto_map(store, path, record, facts, batch):

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .common import OfficeKitError
+from .value_fit import value_fit_issue
 
 _BLANK_MARKS = "_＿-—.·…□☐"
 
@@ -149,4 +150,67 @@ def validate_target(path: str | Path, target: dict[str, Any]) -> dict[str, Any]:
     raise OfficeKitError("不支持的模板类型：%s" % path.suffix)
 
 
-__all__ = ["validate_target"]
+def value_target_issue(path: str | Path, target: dict[str, Any], value: str) -> str | None:
+    """Check whether a proposed value can fit this *one* target.
+
+    Unlike :func:`validate_target`, this is intentionally non-throwing so a
+    preview can surface one affected row for confirmation/blanking instead of
+    turning an entire multi-template batch into a mapping failure.
+    """
+    path = Path(path)
+    try:
+        if path.suffix.lower() == ".docx" and target.get("kind") == "anchor":
+            from .doc_fill import XmlEngine, paragraph_text
+            engine = XmlEngine(path)
+            for par, start, end in engine.find_anchor_hits(target):
+                raw = engine.xml_for(par)
+                issue = value_fit_issue(raw.text if raw is not None else paragraph_text(par), start, end, value)
+                if issue:
+                    return issue
+        elif path.suffix.lower() == ".xlsx" and target.get("kind") == "xlsx_cell":
+            import openpyxl
+            wb = openpyxl.load_workbook(str(path), read_only=True, data_only=False)
+            try:
+                ws = wb[str(target.get("sheet"))] if target.get("sheet") is not None else wb.worksheets[0]
+                text = "" if ws[str(target["cell"])].value is None else str(ws[str(target["cell"])].value)
+                if all(k in target for k in ("span_start", "span_end")):
+                    return value_fit_issue(text, int(target["span_start"]), int(target["span_end"]), value)
+            finally:
+                wb.close()
+    except (KeyError, ValueError, TypeError, OfficeKitError) as exc:
+        return "无法检查该填写位置：%s" % exc
+    return None
+
+
+def target_structure_issue(path: str | Path, target: dict[str, Any]) -> str | None:
+    """Identify a persisted XLSX in-label rule superseded by a value cell.
+
+    Old rules are deliberately not rewritten here: changing a saved location
+    without review is riskier than showing a precise repair request.  The
+    caller may still fill all unrelated rows in the same batch.
+    """
+    path = Path(path)
+    if path.suffix.lower() != ".xlsx" or target.get("kind") != "xlsx_cell":
+        return None
+    if not target.get('anchor') and not all(k in target for k in ("expected_text", "span_start", "span_end")):
+        return None
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(str(path), read_only=False, data_only=False)
+        try:
+            ws = wb[str(target.get("sheet"))] if target.get("sheet") is not None else wb.worksheets[0]
+            cell = ws[str(target["cell"])]
+            text = "" if cell.value is None else str(cell.value)
+            if text.rstrip().endswith(("：", ":")):
+                merged = next((r for r in ws.merged_cells.ranges if cell.coordinate in r), None)
+                right = ws.cell(cell.row, merged.max_col + 1 if merged else cell.column + 1)
+                if right.value in (None, "") and right.data_type != "f" and right.has_style:
+                    return "该标签右侧存在带格式的空值格；旧的标签内填写位置应改为 %s" % right.coordinate
+        finally:
+            wb.close()
+    except (KeyError, ValueError, TypeError) as exc:
+        return "无法检查该填写位置：%s" % exc
+    return None
+
+
+__all__ = ["validate_target", "value_target_issue", "target_structure_issue"]

@@ -46,7 +46,10 @@ test('cancel returns only the resumable task identity, never synthetic answers',
   });
   assert.deepEqual(result, { ok: true, status: 'cancelled', task_id: 'task-1',
     work: 'work', batch: 'b1' });
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].action, 'record_wait');
+  assert.equal(calls[1].user_wait.outcome, 'cancelled');
+  assert.equal(calls[1].answers, undefined);
 });
 
 test('recognizes DSH cancellation error without swallowing unrelated ask errors', async () => {
@@ -72,13 +75,13 @@ test('does not resume on duplicate, missing, or unanswered question replies', as
     { answers: [] },
     { answers: [{ id: 'q1', selected: [] }] },
   ]) {
-    let calls = 0;
+    const calls = [];
     const result = await runOfficeFill({ work: 'work', source: ['in.xlsx'], targets: ['out.xlsx'] }, {
       ask: async () => askResult,
-      run: async () => { calls += 1; return pending(); },
+      run: async (payload) => { calls.push(payload); return pending(); },
     });
     assert.equal(result.status, 'cancelled');
-    assert.equal(calls, 1, 'incomplete answer must not be sent to resume');
+    assert.deepEqual(calls.map(x => x.action), ['start', 'record_wait'], 'incomplete answer must not be sent to resume');
   }
   await assert.rejects(() => runOfficeFill({ work: 'work', source: ['in.xlsx'], targets: ['out.xlsx'] }, {
     ask: async () => ({ answers: [
@@ -86,6 +89,29 @@ test('does not resume on duplicate, missing, or unanswered question replies', as
     ] }),
     run: async () => pending(),
   }), /重复返回问题/);
+});
+
+test('mapping pages use the existing task without asking or advancing', async () => {
+  const calls = [];
+  const result = await runOfficeFill({ work: 'work', task_id: 'task-1',
+    mapping_read: { section: 'positions', template: 'one.xlsx', offset: 5 } }, {
+    ask: async () => { throw new Error('must not ask'); },
+    run: async payload => { calls.push(payload); return { ok: true, status: 'needs_mapping', mapping_page: { items: [] } }; },
+  });
+  assert.equal(result.status, 'needs_mapping');
+  assert.deepEqual(calls, [{ action: 'read_mapping', work: 'work', task_id: 'task-1',
+    mapping_read: { section: 'positions', template: 'one.xlsx', offset: 5 } }]);
+});
+
+test('native waiting is telemetry only and never a model supplied answer', async () => {
+  const calls = [];
+  await runOfficeFill({ work: 'work', task_id: 'task-1' }, {
+    ask: async () => answer(),
+    run: async payload => { calls.push(payload); return payload.action === 'status' ? pending() : completed(); },
+  });
+  assert.equal(calls[1].user_wait.outcome, 'answered');
+  assert.ok(calls[1].user_wait.id);
+  assert.ok(calls[1].user_wait.milliseconds >= 0);
 });
 
 test('rejects multi-select answers for single choice and sends the supported one-source array', async () => {
