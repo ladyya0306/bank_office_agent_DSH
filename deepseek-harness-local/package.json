@@ -1,0 +1,20 @@
+{
+  "name": "deepseek-harness-local",
+  "version": "1.0.0",
+  "description": "Local deployment of DeepSeek Harness",
+  "scripts": {
+    "postinstall": "node patch-fence.cjs",
+    "patch": "node patch-fence.cjs",
+    "start": "node patch-fence.cjs && node start.js --session-office-gate",
+    "start-gated": "node patch-fence.cjs && node start.js --session-office-gate",
+    "dev": "node patch-fence.cjs && node start.js --dev --session-office-gate",
+    "install-dsh": "npm install --save-exact @deepseek-ai/dsh@latest"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "^0.1.5-rc.1",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

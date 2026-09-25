@@ -1,0 +1,114 @@
+{
+  "source": "../tool/office",
+  "copied_at": "2026-09-25T09:26:19.763864",
+  "files": [
+    {
+      "path": "office_kit/absorb.py",
+      "sha256": "9f0130b073496ac4bf172c3a2110ee7a1b1b26e5a2951047741c8e058a0df3ba"
+    },
+    {
+      "path": "office_kit/cli.py",
+      "sha256": "e8bd0938f537b83042b342f00064da0e824902e3d60941c6d5bed3d68e4aec52"
+    },
+    {
+      "path": "office_kit/common.py",
+      "sha256": "f4860abc3b50fc1bb5b5dbd8d1ee2d3db340af7d3af4add3863e6db7f9896f83"
+    },
+    {
+      "path": "office_kit/data_ops.py",
+      "sha256": "b4b12efd97cf523daa64a7507daa18e1d9969aa8933196d04b76d62a1d0839af"
+    },
+    {
+      "path": "office_kit/doc_build.py",
+      "sha256": "e906e515b3fc27f872108195ddc86d5b448b2d8fe1cc8276ccc63128bae37710"
+    },
+    {
+      "path": "office_kit/doc_fill.py",
+      "sha256": "3a4663aed8df7ee5a5676fde8e693e8c17fd742a44b52598b5de244063bf9ad8"
+    },
+    {
+      "path": "office_kit/doc_read.py",
+      "sha256": "6294a737b55f36a87b8b2671f82ff9867319663c4d8bd13a9483f37a7a01a6e9"
+    },
+    {
+      "path": "office_kit/entity_key.py",
+      "sha256": "b10c99f63d34f50a613c8253c24da95fd0fc4effdc9982dfcb10c3db10d266fe"
+    },
+    {
+      "path": "office_kit/file_ops.py",
+      "sha256": "e0b2b2741828a36efe93682157556dff1f3db541a282ad6815c494e31743c459"
+    },
+    {
+      "path": "office_kit/fill_decisions.py",
+      "sha256": "6b4068b4587629f72f29b0d0199d1e672a063662d326844250c3649ddeb4dd3d"
+    },
+    {
+      "path": "office_kit/fingerprint.py",
+      "sha256": "a1427f9a2d3f53d71d1895d03e30728c7fafeca35d500541bbd7db7dc32bb35d"
+    },
+    {
+      "path": "office_kit/harness.py",
+      "sha256": "dd870b49e9a161578e5c3df9cd8770a1d349c57edf0ed04a91345c2e3c3e3a01"
+    },
+    {
+      "path": "office_kit/merge_v2.py",
+      "sha256": "f7ce1a68ae52490f8b3943e34371ecdd2e1dfa3f883e7d64aaab84fd482e63a8"
+    },
+    {
+      "path": "office_kit/migrate_v2.py",
+      "sha256": "0d68999dae435da27dbb31d561d0996c86c2b59a4de58abc4997cf1ace65e52b"
+    },
+    {
+      "path": "office_kit/ocr_ops.py",
+      "sha256": "150bfc4a54de86f1498690222710427a21ca433b921dec352719b0e6ae34f3d0"
+    },
+    {
+      "path": "office_kit/office_com.py",
+      "sha256": "57601262751f20f3dad05227c8dc17c009f11c01f6a3bf6d87903f5e8d44bef7"
+    },
+    {
+      "path": "office_kit/rule_pack.py",
+      "sha256": "8b7267bd10e221b42b2582333ce9c68e66e8f88ab8389a42fe17bf8bb1db9a22"
+    },
+    {
+      "path": "office_kit/schema_v2.py",
+      "sha256": "fc3df553db9c977ec0bea821551f0094ff002d20d09e3fdbc0466c940eb5d393"
+    },
+    {
+      "path": "office_kit/store.py",
+      "sha256": "de816abe1ff67ecfce74ff33accd718da245fe3ef3cf7c68bc81d57ddfefa357"
+    },
+    {
+      "path": "office_kit/store_v2.py",
+      "sha256": "59ce37b368c6160600e6f4f55a80db15202c580fd655bd175b61646c6be75fbb"
+    },
+    {
+      "path": "office_kit/value_fit.py",
+      "sha256": "b025c5e6bd127849d1aed3852ddd3faeedaca0a4b4bcfb70dcb10c3dc24eea89"
+    },
+    {
+      "path": "office_kit/workroot.py",
+      "sha256": "a08b9c3e34345e0284199b0e335ca69d84826fc1d330972b45812c8e6b4431d8"
+    },
+    {
+      "path": "office_kit/xlsx_fidelity.py",
+      "sha256": "afd33981e0a8276ce0663af6bc7a89d4080365827502080c6860fa04e19e1909"
+    },
+    {
+      "path": "office_kit/xml_fill.py",
+      "sha256": "611534c8cdea0f6d349109dbbe1aea5bc969c22f6d468bf98de4b6a899f09466"
+    },
+    {
+      "path": "office_kit/__init__.py",
+      "sha256": "8dccb579ed731e0df2715816fc6a640a08833c95eca49081c2494140adad98e7"
+    },
+    {
+      "path": "office_kit/__main__.py",
+      "sha256": "0900059c364036aafeeb2948e6f789bd5777d66c90d0f4c7cdcd53739bb91fa5"
+    },
+    {
+      "path": "template_rules_verified/README.md",
+      "sha256": "2912960622c4e73d7e61aa5e3b32861135f8a9636678af6f91cc804888b6130b"
+    }
+  ]
+}

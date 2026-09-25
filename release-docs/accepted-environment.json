@@ -1,0 +1,33 @@
+{
+  "accepted_on": "2026-09-25",
+  "accepted_by": "user",
+  "reported_elapsed_seconds": 777,
+  "scope": "single local desktop trial of 15 target files; some blanks and corrections remain",
+  "python": "3.13.14",
+  "node": "v22.18.0",
+  "dsh": "0.1.5-rc.1",
+  "dependencies": {
+    "python-docx": "1.1.2",
+    "openpyxl": "3.1.5",
+    "lxml": "6.0.2",
+    "pandas": "2.3.3",
+    "numpy": "2.2.6",
+    "pypdf": "6.10.2",
+    "pdfplumber": "0.11.10",
+    "pypdfium2": "5.13.0",
+    "python-pptx": "1.0.2",
+    "Pillow": "12.3.0",
+    "docxtpl": "0.19.1",
+    "pywin32": "311",
+    "reportlab": "5.0.1"
+  },
+  "not_in_repository": [
+    "business workspaces",
+    "customer documents",
+    "database files",
+    "session logs",
+    "credentials",
+    "node_modules"
+  ],
+  "runtime_note": "Observed Node v22.18.0; package.json declares >=22.19.0. Preserve this discrepancy; verify an approved target runtime before deployment."
+}

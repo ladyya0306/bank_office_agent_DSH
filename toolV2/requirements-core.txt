@@ -1,0 +1,4 @@
+# Accepted desktop fill-workflow dependencies; optional tools are separate.
+python-docx==1.1.2
+openpyxl==3.1.5
+lxml==6.0.2

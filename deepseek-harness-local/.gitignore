@@ -1,0 +1,21 @@
+# Environment variables
+.env
+
+# Dependencies
+node_modules/
+
+# Workspace data
+workspace/*
+!workspace/plugins/
+workspace/plugins/*
+!workspace/plugins/bank-approval/
+!workspace/plugins/bank-approval-ui/
+!workspace/plugins/session-workspace-gate/
+!workspace/plugins/session-directory-picker-zh/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

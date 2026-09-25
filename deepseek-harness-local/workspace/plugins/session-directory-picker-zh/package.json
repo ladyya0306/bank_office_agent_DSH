@@ -1,0 +1,7 @@
+{
+  "name": "dsh-localized-directory-picker",
+  "version": "0.1.0-local.1",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js"
+}
