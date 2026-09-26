@@ -2,11 +2,13 @@
 from __future__ import annotations
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
 import uuid
 from office_kit.store_v2 import StoreV2, allocate_batch, sha256_file, valid_batch
+from office_kit.common import resolve_inputs
 from office_kit.workroot import init_workroot, is_workroot
 from office_kit.cli import build_parser, _dispatch
 from office_kit.harness import build_fill_plan, current_docx_target_errors, current_xlsx_gaps
@@ -16,7 +18,14 @@ from . import storage as state, source, review, mapping, mapping_view, timing
 ROOT = Path(__file__).resolve().parents[1]
 WorkflowError = ValueError
 POSITION_PARSE_VERSION = 6
-SUBJECT_PLAN_VERSION = 8
+SUBJECT_PLAN_VERSION = 17
+# Bump when document planning itself changes.  Equal inputs may then reuse a
+# stored plan without re-reading every template's slots.
+DOCUMENT_PLAN_VERSION = 1
+XLSX_WRITER_VERSION = 1
+# Kept here because runner owns plan reuse.  Bump alongside a mapping semantic
+# change that can alter automatic positions without changing template bytes.
+MAPPING_COMPATIBILITY_VERSION = 3
 
 
 def command(argv):
@@ -27,7 +36,7 @@ def save(store, task):
     state.put(store.conn, 'office_v2_task', task['id'], task)
 
 
-def response(work, task):
+def response(work, task, execution_summary=None):
     results = []
     for name, record in task.get('documents', {}).items():
         result = {k: record[k] for k in ('status', 'error', 'filled', 'failed', 'coverage', 'blank_slots') if k in record}
@@ -56,11 +65,51 @@ def response(work, task):
             'unsigned': True, 'note': ('部分源材料尚未解析，请查看 issues 中的文件和原文；已生成文件仅包含已处理内容。'
                                      if task.get('source_issues') else '')
                                     + '填报完成的文件供用户复核；未代用户签核。'}
+    waits = task.get('timing', {}).get('stages', {}).get('user_confirmation_wait', {})
+    if waits.get('count'):
+        result['interaction_summary'] = {
+            'recorded_question_batches': waits['count'],
+            'wait_seconds': waits['seconds'],
+            'cancelled_batches': task.get('timing', {}).get('cancelled_waits', 0),
+            'pending_questions': len(task.get('questions', [])),
+            'note': '这是工具内部原生问题面板的历史记录；questions 为空只表示当前无待答，不能据此声称从未提问。'}
+    if task.get('rejected_updates'):
+        result['rejected_updates'] = task['rejected_updates']
+        # Existing completed artifacts remain usable, but the latest update
+        # request was not fully accepted and must not look like controller
+        # success.
+        result['ok'] = False
+        result['success_with_rejected'] = True
     if needs_mapping:
         result.update(mapping_view.initial(task))
     if task.get('delivery') and not needs_mapping:
         result['delivery'] = task['delivery']
+    if execution_summary is not None:
+        result['execution_summary'] = execution_summary
+        if task['status'] == 'completed' and result['ok']:
+            result['next_action'] = (
+                '本次实际执行统计见 execution_summary；当前产物已逐文件核验路径和 SHA-256。'
+                '按 delivery.present_calls 交付并回复统计即可。'
+                '输出目录保留旧版本，遍历目录不能判断本次生成数量。')
     return result
+
+
+def execution_summary(before, task):
+    """Describe only this dispatch call; never persist or scan directories."""
+    generated, reused = [], []
+    for name, record in task.get('documents', {}).items():
+        old = before.get('documents', {}).get(name, {})
+        if record.get('status') != 'completed' or not record.get('output'):
+            continue
+        # A new run id is the durable proof that this call executed or copied
+        # the template.  Recovery can restore a missing output path for an
+        # already successful run, which must remain a reuse.
+        changed = (record.get('run_id') != old.get('run_id') if record.get('run_id')
+                   else (record.get('output') != old.get('output') or
+                         record.get('output_hash') != old.get('output_hash')))
+        (generated if changed else reused).append(name)
+    return {'generated_files': len(generated), 'reused_files': len(reused),
+            'generated_templates': generated}
 
 
 def preserve_output(record):
@@ -104,8 +153,28 @@ def start(store, work, data):
     for key in ('source', 'targets'):
         names = data.get(key)
         if not isinstance(names, list) or not names or not all(isinstance(p, str) for p in names):
-            raise ValueError(f'{key} 必须是非空文件路径数组')
-        lists.append(sorted({state.inside(work, p).relative_to(work).as_posix() for p in names}))
+            raise ValueError(f'{key} 必须是非空文件或目录路径数组')
+        expanded = []
+        for name in names:
+            # Check the supplied root before expansion: resolve_inputs accepts
+            # directories, but a directory (or symlink) outside this work area
+            # must never be enumerated as a source of office materials.
+            supplied = (work / name).resolve(strict=True)
+            if not supplied.is_relative_to(work):
+                raise ValueError(f'文件不在本工作区内：{name}')
+            files = resolve_inputs(str(supplied))
+            if key == 'targets':
+                # A target directory may contain notes and Office lock files.
+                # Only real Word/Excel templates participate in the task.
+                files = [p for p in files if p.suffix.lower() in ('.docx', '.xlsx')
+                         and not p.name.startswith('~$')]
+                if supplied.is_file() and not files:
+                    raise ValueError('当前填报入口支持 Word .docx 与 Excel .xlsx 目标模板')
+            expanded.extend(files)
+        normalized = {state.inside(work, p).relative_to(work).as_posix() for p in expanded}
+        if not normalized:
+            raise ValueError(f'{key} 未找到可用文件')
+        lists.append(sorted(normalized))
     sources, targets = lists
     if set(sources) & set(targets):
         raise ValueError('源文件与目标模板不能是同一个文件')
@@ -154,16 +223,67 @@ def prepare_documents(store, work, task):
                                          if '跨主体红线' not in str(v)
                                          and '不属于本产物' not in str(v)}
             record['subject_plan_version'] = SUBJECT_PLAN_VERSION
-            same_source_content = (
-                record.get('blank_source_content_signature') == task.get('source_content_signature')
-                if record.get('blank_source_content_signature') else
-                record.get('blank_source_signature') in task.get('equivalent_source_signatures', []))
-            if (not same_source_content
-                    or record.get('blank_template_hash') != sha256_file(path)):
+            source_changed = (prior.get('blank_source_content_signature') is not None and
+                              prior.get('blank_source_content_signature') !=
+                              task.get('source_content_signature'))
+            # A user explicitly left this position blank.  New source content
+            # does not revoke that decision; only a changed template invalidates
+            # the physical slot it referred to.
+            if record.get('blank_template_hash') != sha256_file(path):
                 record['blank_slots'] = {}
             record['blank_source_signature'] = task.get('source_signature')
             record['blank_source_content_signature'] = task.get('source_content_signature')
-            record['blank_template_hash'] = sha256_file(path)
+            template_hash = sha256_file(path)
+            record['blank_template_hash'] = template_hash
+            if (source_changed or prior.get('subject_plan_version') != SUBJECT_PLAN_VERSION) and record.get('blank_slots'):
+                # “来源未提供” is a missing-data deferral, not a permanent
+                # user refusal.  Reopen only that slot when a newly supplied
+                # source fact is a unique high-confidence candidate.  Other
+                # explicit leave-blank reasons remain untouched.
+                by_id = {slot['id']: slot for slot in record.get('slots', [])}
+                for slot_id, reason in list(record['blank_slots'].items()):
+                    if not re.search(r'(?:来源|源文件|材料|资料).{0,80}(?:未提供|未给出|没有|未记载|缺失)|缺失', str(reason)):
+                        continue
+                    slot = by_id.get(slot_id)
+                    if slot is None:
+                        continue
+                    candidates = mapping.scoped_candidates(store, path, slot, catalog)
+                    if (candidates and candidates[0]['score'] >= .85 and
+                            (len(candidates) == 1 or
+                             candidates[1]['score'] != candidates[0]['score'])):
+                        from office_kit.target_validation import value_target_issue
+                        from office_kit.harness import _missing_source_value_reason
+                        field = candidates[0]['field']
+                        value = catalog[field].get('value')
+                        if (value not in (None, '') and
+                                not _missing_source_value_reason(field, value) and
+                                not value_target_issue(path, slot['target'], str(value))):
+                            record['blank_slots'].pop(slot_id, None)
+            inputs = state.digest([DOCUMENT_PLAN_VERSION, MAPPING_COMPATIBILITY_VERSION,
+                                   mapping.SLOT_DISCOVERY_VERSION, POSITION_PARSE_VERSION,
+                                   SUBJECT_PLAN_VERSION, template_hash,
+                                   store.rules_for(path), facts, roles,
+                                   record.get('blank_slots'),
+                                   *([XLSX_WRITER_VERSION] if path.suffix.lower() == '.xlsx' else [])])
+            # A status/read call and an idempotent position update must not
+            # rescan every Word/Excel slot when all inputs are unchanged.
+            # Source/template/rule/fact/role/version changes are all in the
+            # digest, so only affected documents fall through to planning.
+            output_ok = True
+            if prior.get('status') == 'completed':
+                output = work / prior.get('output', '__absent__')
+                output_ok = (output.is_file() and bool(prior.get('output_hash')) and
+                             sha256_file(output) == prior.get('output_hash'))
+            if prior.get('inputs') == inputs and prior.get('plan') and output_ok:
+                record.update(inputs=inputs)
+                if record.get('status') == 'needs_mapping' and record.get('validation_errors'):
+                    task['issues'].append({
+                        'template': name,
+                        'problems': record.get('validation_errors', record.get('error', [])),
+                        'current_positions': record.get('current_positions', []),
+                    })
+                task['documents'][name] = record
+                continue
             if (prior.get('proposed_version') != POSITION_PARSE_VERSION
                     or prior.get('proposed_hash') != sha256_file(path)):
                 command(['db-propose', str(path), '--work', str(work), '--batch', task['batch']])
@@ -173,7 +293,15 @@ def prepare_documents(store, work, task):
             mapping.auto_map(store, path, record, catalog, task['batch'])
             uncovered = mapping.inspect(store, path, record, catalog)
             record['current_positions'] = [{'field': r['field'], 'target': r['target']} for r in store.rules_for(path)]
-            inputs = state.digest([POSITION_PARSE_VERSION, SUBJECT_PLAN_VERSION, sha256_file(path), store.rules_for(path), facts, roles, record.get('blank_slots')])
+            # `auto_map` may add or retire rules.  Persist the final rule
+            # state, not the pre-migration state used for the fast-path gate;
+            # otherwise the next unchanged status unnecessarily re-previews.
+            inputs = state.digest([DOCUMENT_PLAN_VERSION, MAPPING_COMPATIBILITY_VERSION,
+                                   mapping.SLOT_DISCOVERY_VERSION, POSITION_PARSE_VERSION,
+                                   SUBJECT_PLAN_VERSION, template_hash,
+                                   store.rules_for(path), facts, roles,
+                                   record.get('blank_slots'),
+                                   *([XLSX_WRITER_VERSION] if path.suffix.lower() == '.xlsx' else [])])
             if prior.get('inputs') == inputs and prior.get('plan'):
                 plan = prior['plan']
             else:
@@ -181,6 +309,8 @@ def prepare_documents(store, work, task):
                                        run_id=prior.get('plan', {}).get('run_id') or f"{task['batch']}-V2-{uuid.uuid4().hex[:12]}")
                 task['counts']['previews'] += 1
             plan.update(db_path=str(work / 'db/workflow.db'), template_files=[str(path)])
+            if path.suffix.lower() == '.xlsx':
+                plan['writer_version'] = XLSX_WRITER_VERSION
             if prior.get('plan') and prior.get('inputs') != inputs:
                 from office_kit.fill_decisions import reuse_unchanged_choices
                 reuse_unchanged_choices(prior['plan'], plan)
@@ -188,33 +318,36 @@ def prepare_documents(store, work, task):
                                           'blank_targets': [s['target'] for s in record.get('slots', [])
                                                             if s['id'] in record.get('blank_slots', {})]}
             if prior.get('inputs') == inputs:
-                errors = prior.get('validation_errors', [])
+                validation_errors = prior.get('validation_errors', [])
             else:
-                errors = [r for r in plan['rows'] if r['kind'] == 'template_note']
-                errors += current_docx_target_errors([path], plan)
-                errors += current_xlsx_gaps(store, [path], plan)
+                # A plain unmapped slot is represented by coverage and
+                # mapping_requests.  It is not a validation error and should
+                # not duplicate every position into the issues page.
+                validation_errors = current_docx_target_errors([path], plan)
+                validation_errors += current_xlsx_gaps(store, [path], plan)
                 for rule in store.rules_for(path):
                     try:
                         mapping.validate_target(path, rule['target'])
                     except Exception as exc:
-                        errors.append({'field': rule['field'], 'reason': str(exc),
-                                       'target': rule['target']})
+                        validation_errors.append({'field': rule['field'], 'reason': str(exc),
+                                                  'target': rule['target']})
             if record.get('slots') and not uncovered and not store.rules_for(path):
                 # User requested missing/uncertain data remain blank. A template
                 # whose positions were all accounted for can be copied unchanged.
                 plan['rows'] = []
-                errors = []
-            record.update(inputs=inputs, validation_errors=list(errors))
-            if uncovered:
-                errors = list(errors) + [{'reason': '仍有填写位置未关联源字段；请按 mapping_requests 一次补齐或说明留空原因',
-                                          'count': len(uncovered)}]
+                validation_errors = []
+            record.update(inputs=inputs, validation_errors=list(validation_errors))
             record['plan'] = plan
-            if errors:
+            if validation_errors:
                 preserve_output(record)
-                record.update(status='needs_mapping', error=errors)
-                task['issues'].append({'template': name, 'problems': errors,
+                record.update(status='needs_mapping', error=validation_errors)
+                task['issues'].append({'template': name, 'problems': validation_errors,
                                       'current_positions': [{'field': r['field'], 'target': r['target']}
                                                             for r in store.rules_for(path)]})
+            elif uncovered:
+                preserve_output(record)
+                record.update(status='needs_mapping')
+                record.pop('error', None)
             else:
                 signature = review.execution_signature(plan)
                 if prior.get('status') == 'running' and prior.get('signature') == signature:
@@ -343,26 +476,57 @@ def execute_documents(store, work, task):
 def update_positions(store, work, task, updates):
     if not isinstance(updates, list) or not updates:
         raise ValueError('没有提供需要修改的位置')
-    checked, blanks = mapping.compile_updates(store, work, task, updates)
-    # Check legacy replacements too before saving any change in this request.
-    for path, update in checked:
-        mapping.combine(store, path, update)
-    for path, update in checked:
-        name = path.relative_to(work).as_posix()
-        tid = store.register_template(path, task['batch'])
-        if update.get('slot_id'):
-            mapping.retire_overlap(store, path, update['target'], update['field'], task['batch'])
-            task['documents'][name].setdefault('blank_slots', {}).pop(update['slot_id'], None)
-        target = mapping.combine(store, path, update)
-        store.add_rule(tid, update['field'], update.get('label', update['field']), target,
-                       confidence=1.0, decided_by='model', batch_no=task['batch'])
-    for name, slot_id, reason in blanks:
-        record = task['documents'][name]
-        slot = next(s for s in record['slots'] if s['id'] == slot_id)
-        mapping.retire_overlap(store, work / name, slot['target'], None, task['batch'])
-        record.setdefault('blank_slots', {})[slot_id] = reason
+    grouped = {}
+    for update in updates:
+        name = update.get('template') if isinstance(update, dict) else None
+        grouped.setdefault(name, []).append(update)
+    rejected = []
+    accepted = False
+    task['rejected_updates'] = []
+    for name, template_updates in grouped.items():
+        # Keep a template atomic, but do not make one bad template discard
+        # correctly scoped changes for other templates in the same request.
+        try:
+            checked, blanks = mapping.compile_updates(store, work, task, template_updates)
+            # Validate all legacy replacements before this template writes.
+            for path, update in checked:
+                mapping.combine(store, path, update)
+        except (ValueError, KeyError, TypeError) as exc:
+            rejected_item = {'template': name, 'updates': template_updates,
+                             'reason': str(exc)}
+            slot_id = getattr(exc, 'slot_id', None)
+            if slot_id and name in task.get('documents', {}):
+                slot = next((item for item in task['documents'][name].get('slots', [])
+                             if item['id'] == slot_id), None)
+                rejected_item.update(slot_id=slot_id, label=getattr(exc, 'label', None) or (slot or {}).get('label'),
+                                     positions_read={'section': 'positions', 'template': name})
+                if slot is None:
+                    import difflib
+                    slots = task['documents'][name].get('slots', [])
+                    nearby = difflib.get_close_matches(slot_id, [s['id'] for s in slots], n=3, cutoff=.85)
+                    rejected_item['similar_positions'] = [
+                        {'id': s['id'], 'label': s.get('label')} for key in nearby for s in slots if s['id'] == key]
+            rejected.append(rejected_item)
+            continue
+        for path, update in checked:
+            resolved_name = path.relative_to(work).as_posix()
+            tid = store.register_template(path, task['batch'])
+            if update.get('slot_id'):
+                mapping.retire_overlap(store, path, update['target'], update['field'], task['batch'])
+                task['documents'][resolved_name].setdefault('blank_slots', {}).pop(update['slot_id'], None)
+            target = mapping.combine(store, path, update)
+            store.add_rule(tid, update['field'], update.get('label', update['field']), target,
+                           confidence=1.0, decided_by='model', batch_no=task['batch'])
+        for resolved_name, slot_id, reason in blanks:
+            record = task['documents'][resolved_name]
+            slot = next(s for s in record['slots'] if s['id'] == slot_id)
+            mapping.retire_overlap(store, work / resolved_name, slot['target'], None, task['batch'])
+            record.setdefault('blank_slots', {})[slot_id] = reason
+        accepted = True
+    task['rejected_updates'] = rejected
     save(store, task)
-    advance(store, work, task)
+    if accepted:
+        advance(store, work, task)
 
 
 def dispatch(data):
@@ -375,6 +539,25 @@ def dispatch(data):
         if data.get('action') != 'start':
             raise ValueError('工作区尚未初始化，请先开始任务')
         init_workroot(work)
+    if data.get('action') == 'read_mapping':
+        # Readers use one committed task snapshot. They neither initialise the
+        # schema nor take the writer lock, so independent evidence reads do not
+        # block each other or create another fill execution.
+        import sqlite3
+        with sqlite3.connect((work / 'db/workflow.db').as_uri() + '?mode=ro', uri=True) as conn:
+            task = state.get(conn, 'office_v2_task', data.get('task_id', ''))
+        if task is None:
+            raise ValueError('找不到该任务')
+        task['last_work'] = str(work)
+        result = {'ok': True, 'status': task['status'], 'task_id': task['id'],
+                  'work': str(work), 'batch': task['batch'], 'counters': task['counts']}
+        with template_read_cache():
+            try:
+                result['mapping_page'] = mapping_view.page(task, data.get('mapping_read') or {})
+            except Exception as exc:
+                result.update(ok=False, status='failed', error=str(exc), questions=[],
+                              resume_status=task['status'])
+        return result
     with state.work_lock(work), template_read_cache(), StoreV2(work / 'db/workflow.db', actor='workflow') as store:
         state.initialise(store.conn)
         action = data.get('action')
@@ -383,6 +566,7 @@ def dispatch(data):
         try:
             if action == 'start':
                 task = start(store, work, data)
+                before_execution = {'documents': {name: dict(record) for name, record in task.get('documents', {}).items()}}
                 started = timing.begin(task)
                 advance(store, work, task)
             else:
@@ -390,6 +574,7 @@ def dispatch(data):
                 if task is None:
                     raise ValueError('找不到该任务')
                 rebase(store, work, task)
+                before_execution = {'documents': {name: dict(record) for name, record in task.get('documents', {}).items()}}
                 if action == 'read_mapping':
                     return {'ok': True, 'status': task['status'], 'task_id': task['id'],
                             'work': str(work), 'batch': task['batch'],
@@ -436,4 +621,4 @@ def dispatch(data):
                 from .report import write
                 write(work, task)
             save(store, task)
-        return response(work, task)
+        return response(work, task, execution_summary(before_execution, task))

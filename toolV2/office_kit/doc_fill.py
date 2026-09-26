@@ -627,7 +627,7 @@ class XlsxEngine:
         import openpyxl
 
         self.template = Path(template)
-        self.wb = openpyxl.load_workbook(str(template))
+        self.wb = openpyxl.load_workbook(str(template), rich_text=True)
         self.edits: list[tuple[str, str, str]] = []
         # Precise spans are expressed against the original cell text.  Keep
         # one immutable baseline and rebuild it after every edit so a longer
@@ -635,16 +635,58 @@ class XlsxEngine:
         self._precise: dict[tuple[str, str], dict[str, Any]] = {}
 
     @staticmethod
+    def _rich_text(value):
+        """Return visible text plus one font per character for CellRichText."""
+        from openpyxl.cell.rich_text import CellRichText, TextBlock
+        if not isinstance(value, CellRichText):
+            text = '' if value is None else str(value)
+            return text, [None] * len(text)
+        text, fonts = '', []
+        for part in value:
+            if isinstance(part, TextBlock):
+                chunk, font = part.text, part.font
+            else:
+                chunk, font = str(part), None
+            text += chunk; fonts.extend([font] * len(chunk))
+        return text, fonts
+
+    @staticmethod
+    def _rich_replace(original_value, original, edits):
+        from openpyxl.cell.rich_text import CellRichText, TextBlock
+        if not isinstance(original_value, CellRichText):
+            result = original
+            for start, end, replacement in sorted(edits, reverse=True):
+                result = result[:start] + replacement + result[end:]
+            return result
+        text, fonts = XlsxEngine._rich_text(original_value)
+        if text != original:
+            raise OfficeKitError('富文本原文与填写位置不一致，未写入')
+        pieces = []
+        cursor = 0
+        for start, end, replacement in sorted(edits):
+            pieces.append((original[cursor:start], fonts[cursor:start]))
+            inherit = fonts[start] if start < len(fonts) else (fonts[-1] if fonts else None)
+            pieces.append((replacement, [inherit] * len(replacement)))
+            cursor = end
+        pieces.append((original[cursor:], fonts[cursor:]))
+        from itertools import chain, groupby
+        result = CellRichText()
+        for font, run in groupby(chain.from_iterable(zip(chunk, fs) for chunk, fs in pieces), key=lambda item: item[1]):
+            text = ''.join(char for char, _ in run)
+            result.append(text if font is None else TextBlock(font, text))
+        return result
+
+    @staticmethod
     def _adjacent_unit_value_cell(ws, cell):
         """Return the adjacent unit-wrapper value cell for a trailing-colon label."""
-        current = cell.value
-        if not isinstance(current, str) or not current.rstrip().endswith(("：", ":")):
+        current = '' if cell.value is None else str(cell.value)
+        if not current.rstrip().endswith(("：", ":")):
             return None
         merged = next((r for r in ws.merged_cells.ranges if cell.coordinate in r), None)
         next_col = merged.max_col + 1 if merged else cell.column + 1
         candidate = ws.cell(cell.row, next_col)
         from .value_fit import unit_wrapper_span
-        return candidate if unit_wrapper_span(candidate.value) else None
+        return candidate if unit_wrapper_span(str(candidate.value or '')) else None
 
     def fill_xlsx_cell(self, spec: dict[str, Any], value: str) -> bool:
         coord = str(spec["cell"])
@@ -686,7 +728,7 @@ class XlsxEngine:
                 start, end = int(spec["span_start"]), int(spec["span_end"])
             except (TypeError, ValueError) as exc:
                 raise OfficeKitError("xlsx span_start/span_end 必须是整数") from exc
-            observed = "" if current is None else str(current)
+            observed, _fonts = self._rich_text(current)
             key = (ws.title, coord)
             state = self._precise.get(key)
             original = state["original"] if state is not None else observed
@@ -697,7 +739,7 @@ class XlsxEngine:
             blank_marks = "_＿-—.·…□☐"
             if any(ch not in blank_marks and not ch.isspace() for ch in original[start:end]):
                 raise OfficeKitError(f"{ws.title}!{requested_coord} 精确区间含已有文字")
-            state = self._precise.setdefault(key, {"original": original, "edits": []})
+            state = self._precise.setdefault(key, {"original": original, "value": current, "edits": []})
             if state["original"] != original:
                 raise OfficeKitError(f"{ws.title}!{requested_coord} 原文已改变")
             if any(start < b and a < end for a, b, _ in state["edits"]):
@@ -705,16 +747,13 @@ class XlsxEngine:
             from .value_fit import fit_value
             fitted = fit_value(original, start, end, value)
             state["edits"].append((start, end, fitted))
-            rebuilt = original
-            for a, b, replacement in sorted(state["edits"], reverse=True):
-                rebuilt = rebuilt[:a] + replacement + rebuilt[b:]
-            cell.value = rebuilt
+            cell.value = self._rich_replace(state['value'], original, state['edits'])
             self.edits.append((ws.title, coord, str(cell.value)))
             return True
         if current in (None, "") or not str(current).strip():
             cell.value = value
         else:
-            text = str(current)
+            text, _fonts = self._rich_text(current)
             anchor = spec.get("anchor")
             if not anchor:
                 raise OfficeKitError(
@@ -776,7 +815,7 @@ class XlsxEngine:
                 else:
                     # A label with no following text has an implicit blank slot.
                     gap_replacement = gap + fitted
-            cell.value = text[:start] + gap_replacement + text[end:]
+            cell.value = self._rich_replace(current, text, [(start, end, gap_replacement)])
         self.edits.append((ws.title, coord, str(cell.value)))
         return True
 

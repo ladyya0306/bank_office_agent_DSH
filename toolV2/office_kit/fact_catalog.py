@@ -6,6 +6,7 @@ metadata and adds only the relationship metadata needed by the planner.
 from __future__ import annotations
 
 import re
+import hashlib
 from collections import defaultdict
 
 
@@ -14,6 +15,20 @@ _ROLE_FIELDS = {"借款人", "保证人", "法定代表人"}
 _LEGAL_KEYS = {"借款人法定代表人", "保证人法定代表人", "法定代表人"}
 _ID_FIELDS = {"证件类型", "证件号码", "身份证号码", "身份证号", "护照号码", "护照号"}
 _TARGET_ROLE_RE = re.compile(r"(?:保证人|担保人)[（(]?\s*(\d+)\s*[）)]?|借款人|授信申请人")
+# A form can contain a repeated signer block which its own text says to add or
+# remove as signers change.  That instruction is evidence that the next blank
+# is optional, not evidence that it belongs to the borrower in an earlier block.
+_OPTIONAL_PARTY_RE = re.compile(
+    r"(?:可\s*)?(?:根据|按)\s*(?:签署|签约|签字|参与)(?:方|主体).{0,12}"
+    r"(?:个数|数量).{0,12}(?:增减|增删|调整)|"
+    r"(?:签署|签约|签字)(?:方|主体).{0,12}(?:个数|数量).{0,12}(?:增减|增删|调整)"
+)
+_COMPANY_BLOCK_HEADER_RE = re.compile(
+    r"(?:企业|公司|单位)\s*(?:名称|名)?\s*(?:[（(][^）)\r\n]*[）)]\s*)?[：:]")
+_BLOCK_BOUNDARY_RE = re.compile(
+    r"经过对.*(?:签约|签章|签署).*核实|(?:签约|签章|签署)核实(?:书|表|意见)?|"
+    r"^\s*(?:第?[一二三四五六七八九十]+[、.]|\d+[、.])"
+)
 
 
 def _scope(store):
@@ -122,6 +137,52 @@ def target_subject_context(store, path, target: dict, *, label: str = "",
                 tiers.append([str(ws.cell(r, c).value or "") for c in range(1, ws.max_column + 1)])
     except (IndexError, KeyError, TypeError, ValueError, OSError):
         pass
+    # A repeated signer block may span several identity fields (company name,
+    # representative, address, contact and bank account).  Find its nearest
+    # company-name header instead of relying on a paragraph count.  An empty
+    # paragraph or a new verification conclusion/section ends that block, so
+    # the optional instruction cannot leak into the next normal borrower area.
+    tier_texts = [" ".join(tier).strip() for tier in tiers]
+    header_index = next((i for i, text in enumerate(tier_texts)
+                         if _COMPANY_BLOCK_HEADER_RE.search(text)), None)
+    additional_party = False
+    additional_party_block_id = None
+    binding_text = ""
+    if header_index is not None:
+        header = tier_texts[header_index]
+        directive_index = header_index + 1
+        while directive_index < len(tier_texts) and tier_texts[directive_index] == header:
+            directive_index += 1
+        directive = (tier_texts[directive_index]
+                     if directive_index < len(tier_texts) else "")
+        # These are the fields after the header and before the current target.
+        # Any semantic divider makes the older header irrelevant.
+        later_block = tier_texts[:header_index]
+        bounded = not any(not text or _BLOCK_BOUNDARY_RE.search(text) for text in later_block)
+        binding_text = " ".join(tier_texts[:header_index + 1] + [directive])
+        explicit_role, _explicit_number = mark([binding_text])
+        entity_names = _entity_names(store)
+        explicit_entity = any(name and name in binding_text
+                              for names in entity_names.values() for name in names)
+        additional_party = bool(bounded and _OPTIONAL_PARTY_RE.search(header + " " + directive)
+                                and explicit_role is None and not explicit_entity)
+        if additional_party:
+            # The header's physical location, rather than its business text,
+            # separates repeated optional signer blocks in one template.
+            offset = max(header_index - 1, 0)
+            if target.get('kind') == 'anchor':
+                location = (target.get('part', 'word/document.xml'),
+                            int(target.get('paragraph_index', 0)) - offset)
+            elif target.get('kind') == 'cell':
+                location = ('table', int(target.get('table', 0)),
+                            int(target.get('row', 0)) - offset)
+            else:
+                location = (target.get('sheet'), target.get('cell'), header_index)
+            identity = repr((str(path.resolve()), target.get('kind'), location)).encode('utf-8')
+            additional_party_block_id = 'optional-' + hashlib.sha256(identity).hexdigest()[:20]
+    else:
+        explicit_role, _explicit_number = mark([" ".join(tier) for tier in tiers[:3]])
+
     role = number = None
     for tier in tiers:
         found_role, found_number = mark(tier)
@@ -144,23 +205,33 @@ def target_subject_context(store, path, target: dict, *, label: str = "",
         re.match(r"\s*(?:有限)?公司", raw[end:]) and
         re.search(r"授信|借款|贷款", raw[end:]) and
         re.search(r"保证|担保", raw[end:]))
-    if guarantee_recipient:
+    guaranteed_credit_amount = bool(
+        re.search(r"为[^。；;]*公司[^。；;]*申请(?:的)?[^。；;]*$", raw[:start]) and
+        re.match(r"\s*(?:亿元|万元|元)\s*授信", raw[end:]) and
+        re.search(r"保证|担保", raw[end:]))
+    if guarantee_recipient or guaranteed_credit_amount:
         role, number = "借款人", None
     claims = _roles(store)
-    if role is None:
-        filename = path.stem
+    if additional_party:
+        # Do not let a role found in an older preceding section default this
+        # optional signer block to the borrower.  A human/model may still map
+        # it explicitly; this only prevents automatic inference.
+        role, number = None, None
+    filename = path.stem
+    if role is None and not additional_party:
         named = [r for r in ("借款人", "保证人") if r in filename]
         role = named[0] if len(named) == 1 else None
+    declared_role, declared_number = role, number
     candidates = [eid for eid, items in claims.items()
                   if any(item["role"] == role for item in items)] if role else []
-    if role is None:
+    if role is None and not additional_party:
         borrowers = [eid for eid, items in claims.items()
                      if any(item["role"] == "借款人" for item in items)]
         # A unique borrower is not a license to fill an otherwise anonymous
         # repeated “法定代表人/联系电话” slot.  Default only when the filename
         # or actual nearby text declares ordinary borrower business context.
         business_text = " ".join(" ".join(tier) for tier in tiers)
-        borrower_context = bool(re.search(r"借款|授信|用信|贷款|客户|本公司|申请", filename + " " + business_text))
+        borrower_context = bool(re.search(r"借款|授信|用信|贷款|客户|本公司|申请|签约核实|签章核实", filename + " " + business_text))
         if len(borrowers) == 1 and borrower_context:
             role, candidates = "借款人", borrowers
     if role == "保证人" and number is not None:
@@ -169,6 +240,10 @@ def target_subject_context(store, path, target: dict, *, label: str = "",
             int(_GUARANTOR_MARK.search(item["evidence"] or "").group(1)) == number
             for item in claims[eid])]
         candidates = numbered
+    if role == '保证人' and number is None and any(word in path.stem for word in ('法定代表人身份证明', '董事会决议')):
+        companies = [eid for eid in candidates if store.is_company_evidenced(eid)]
+        if companies:
+            candidates = companies
     # Meaning belongs to this *span*, never to another blank in the same
     # paragraph. A certificate paragraph can contain name, ID, sex and age;
     # only the first two have source-backed relation fields.
@@ -186,19 +261,51 @@ def target_subject_context(store, path, target: dict, *, label: str = "",
         # for any later certificate text.
         "法定代表人" if certificate_template and re.match(r"\s*同志", after) else
         "法定代表人证件号码" if certificate_template and re.search(r"身份证|护照|通行证|证件号", before) else
-        "法定代表人" if re.search(r"法定代表人|法人代表", slot_text) else
+        "法定代表人证件号码" if re.search(r"(?:法定代表人|法人代表)(?:或授权代理人)?(?:身份证|证件)(?:号|号码)[：:]?\s*$", raw[:start]) else
+        "法定代表人" if re.search(r"(?:法定代表人|法人代表)(?:或授权代理人)?(?:姓名)?\s*[：:]?\s*$", before) else
         "名称" if re.search(r"(?:保证人|担保人).{0,4}(?:名称|姓名)", slot_text) else None)
-    if guarantee_recipient:
+    if re.search(r'配偶', before):
+        field_hint = '配偶姓名及证件号码'
+    elif certificate_template and re.match(r'\s*职务', after):
+        field_hint = '职务'
+    elif guaranteed_credit_amount:
+        field_hint = '授信金额'
+    elif guarantee_recipient:
         field_hint = '名称'
+    elif (re.search(r'经过对\s*$', before) and re.match(r'\s*签约', after)) or re.match(r'\s*[（(]以下简称[“"\s]*(?:借款人|保证人)', after):
+        field_hint = '名称'
+    elif re.match(r'\s*(?:有限公司|有限责任公司|公司|董事会)', after):
+        field_hint = '名称'
+    elif event_place := re.search(r'((?:会议|核实|签约|签章|签署)地点)[：:]?\s*$', before):
+        field_hint = event_place.group(1)
+    elif re.search(r'(?:业务品种|用信品种|单笔用信业务)[：:]?\s*$', before):
+        field_hint = '用信业务品种'
+    elif re.search(r'(?:地址|住所|办公地点)[：:]?\s*$', before):
+        field_hint = '地址'
+    elif re.search(r'(?:本次(?:申请)?(?:用信|借款)|放款|本次业务金额)(?:人民币)?\s*$', before):
+        field_hint = '借款金额'
+    elif re.search(r'合同金额\s*$', before):
+        if re.search(r'流动资金贷款合同|借款合同',raw[:start]):
+            field_hint = '借款金额'
+        elif '授信' in raw[:start]:
+            field_hint = '授信金额'
+    elif re.search(r'(?:合同编号|编号为)[^，。；;（）()]{0,40}$', raw[:start]):
+        field_hint = '合同编号'
     elif re.search(r"开户(?:银)?行及账号\s*[：:]?\s*$", before):
         field_hint = '开户行及账号'
     elif re.search(r"(?:姓名|名称)及(?:身份证|证件)(?:号|号码)?\s*[：:]?\s*$", before):
         field_hint = ('法定代表人姓名及证件号码' if '法定代表人' in raw[:start]
                       else '名称及证件号码')
+    reason = ("可选签署方重复区块未声明角色、编号或主体名称；未默认复制借款人"
+              if additional_party else
+              ("位置文字明确%s%s" % (role, number if number is not None else "")
+               if role else "位置正文和文件名均未声明主体"))
     return {"role": role, "number": number, "entity_ids": sorted(candidates),
             "field_hint": field_hint,
-            "reason": ("位置文字明确%s%s" % (role, number if number is not None else "")
-                       if role else "位置正文和文件名均未声明主体")}
+            "additional_party": additional_party,
+            "declared_role": declared_role, "declared_number": declared_number,
+            "additional_party_block_id": additional_party_block_id,
+            "reason": reason}
 
 
 def _role_number(evidence: str) -> int | None:
@@ -354,7 +461,41 @@ def qualified_facts(store) -> dict[str, dict]:
                  _meta(row, base=row["key"], owner=owner, entity_id=person,
                        entity_name=(names.get(person) or [None])[0]))
     _composite_facts(out)
+    _available_credit(out)
     return out
+
+
+def _available_credit(out):
+    """Expose credit minus used credit with both source amounts as evidence."""
+    from decimal import Decimal
+    from .value_fit import _amount_unit, _converted_amount
+    from .common import OfficeKitError
+    prefixes = {m.group(0) for key in out if (m := re.match(r'^(?:借款人|保证人\d*)', key))}
+    for prefix in prefixes:
+        if any(prefix + key in out for key in ('可用授信额度', '可用额度', '可使用授信额度')):
+            continue
+        credit = next((out[prefix+k] for k in ('授信金额','授信额度') if prefix+k in out), None)
+        used = next((out[prefix+k] for k in ('已用额度','已使用额度','已使用授信额度') if prefix+k in out), None)
+        if not credit or not used or credit.get('_ambiguous') or used.get('_ambiguous'):
+            continue
+        if (credit.get('entity_id'),credit.get('_relation_owner_eid')) != (used.get('entity_id'),used.get('_relation_owner_eid')):
+            continue
+        unit = _amount_unit(str(credit.get('value') or ''))
+        if not unit or not _amount_unit(str(used.get('value') or '')):
+            continue
+        try:
+            available = Decimal(_converted_amount(str(credit['value']),unit)) - Decimal(_converted_amount(str(used['value']),unit))
+        except OfficeKitError:
+            continue
+        if available < 0:
+            continue
+        meta = {k:v for k,v in credit.items() if k not in ('id','fact_id')}
+        meta.update(value=format(available.normalize(),'f')+unit, source_kind='computed',
+                    provenance=f"可用额度=授信额度({credit['value']})-已用额度({used['value']})；"+
+                               str(credit.get('provenance') or '')+'；'+str(used.get('provenance') or ''),
+                    fact_ids=[p.get('fact_id',p.get('id')) for p in (credit,used)],
+                    _base_field='可用授信额度',_qualified=True)
+        out[prefix+'可用授信额度']=meta
 
 
 def _composite_facts(out):

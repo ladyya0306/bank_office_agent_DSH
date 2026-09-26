@@ -28,6 +28,18 @@ _DATE_PART = r"\d{4}(?:\s*年(?:\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日?)?)?|[-./]\d
 _DATE_RANGE = re.compile(_DATE_PART + r"\s*起?\s*(?:至|到|[-—–~～]+)\s*" + _DATE_PART)
 
 
+def _printed_amount_unit(text: str, start: int, end: int) -> str | None:
+    right = text[end:].lstrip()
+    suffix = next((unit for unit in _AMOUNT_UNITS if right.startswith(unit)), None)
+    if suffix:
+        return suffix
+    # A label may already supply the unit before its blank, e.g.
+    # “金额（万元）：____”. Reuse exactly the same Decimal conversion as
+    # “金额：____万元”; do not append a second unit inside the value.
+    label_unit = re.search(r'[（(]\s*(亿元|万元|元)\s*[）)]\s*[：:]?\s*$', text[:start])
+    return label_unit.group(1) if label_unit else None
+
+
 def value_fit_issue(text: str, start: int, end: int, source_value: str) -> str | None:
     """Return a local, explainable incompatibility without changing a template.
 
@@ -39,7 +51,7 @@ def value_fit_issue(text: str, start: int, end: int, source_value: str) -> str |
     if right.startswith(("年", "个月", "月")) and _DATE_RANGE.search(value):
         unit = "年" if right.startswith("年") else ("个月" if right.startswith("个月") else "月")
         return "模板此处固定印有“%s”，需要期限数量；来源值是日期区间，不能直接填写" % unit
-    amount_unit = next((unit for unit in _AMOUNT_UNITS if right.startswith(unit)), None)
+    amount_unit = _printed_amount_unit(text, start, end)
     if amount_unit and not _AMOUNT_VALUE.fullmatch(value):
         return "模板此处固定印有人民币金额单位“%s”，来源值不是可识别的人民币数字金额；不能进行跨币种换算" % amount_unit
     return None
@@ -99,11 +111,19 @@ def fit_value(text: str, start: int, end: int, source_value: str) -> str:
     left = text[:start].rstrip()
     right = text[end:].lstrip()
 
-    printed_amount_unit = next((unit for unit in _AMOUNT_UNITS if right.startswith(unit)), None)
+    printed_amount_unit = _printed_amount_unit(text, start, end)
     if printed_amount_unit:
         value = _converted_amount(value, printed_amount_unit)
     if left.endswith("人民币") and value.strip().startswith("人民币"):
         value = value.strip()[len("人民币"):].lstrip()
+
+    # Keep a contract-number prefix already printed by the template. Match
+    # literal text, not a bank/year-specific naming convention.
+    number_prefix = re.search(r'(?:合同编号(?:为)?|编号为)\s*[：:]?\s*([^\n，。；;（）()【】]+)$', left)
+    if number_prefix and right.startswith('号'):
+        prefix = number_prefix.group(1).strip()
+        if prefix and value.strip().startswith(prefix):
+            value = value.strip()[len(prefix):].lstrip()
 
     # A printed 元 can complete 800万 + 元. It cannot turn 800美元 into a
     # renminbi amount. Require a plain numeric amount before this suffix;

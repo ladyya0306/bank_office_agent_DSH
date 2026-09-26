@@ -72,6 +72,31 @@ def test_unit_wrappers_fill_once_and_keep_zero_without_repeating_units():
         check.close()
 
 
+def test_unit_in_label_uses_the_existing_exact_amount_conversion(tmp_path):
+    book = Workbook()
+    sheet = book.active
+    sheet['A1'] = '放款金额（万元）：____'
+    sheet['A2'] = '合同金额(亿元)：____'
+    path = tmp_path / 'different-label-layout.xlsx'
+    book.save(path)
+    book.close()
+    slots = {slot['target']['cell']: slot for slot in discover_slots(path)}
+    engine = XlsxEngine(path)
+    engine.fill_xlsx_cell(slots['A1']['target'], '3200元')
+    engine.fill_xlsx_cell(slots['A2']['target'], '25万元')
+    output = tmp_path / 'filled.xlsx'
+    engine.save(output)
+    check = load_workbook(output)
+    try:
+        assert check.active['A1'].value == '放款金额（万元）：0.32'
+        assert check.active['A2'].value == '合同金额(亿元)：0.0025'
+    finally:
+        check.close()
+    text = '金额（万元）：____'
+    with pytest.raises(OfficeKitError):
+        fit_value(text, text.index('____'), len(text), '30美元')
+
+
 def test_legacy_label_cell_write_is_rejected_when_unit_value_cell_exists():
     with TemporaryDirectory() as tmp:
         template = Path(tmp) / '合成台账.xlsx'

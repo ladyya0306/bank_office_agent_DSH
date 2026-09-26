@@ -94,7 +94,7 @@ SYNONYMS: dict[str, list[str]] = {
     "业务编号": ["业务编号", "业务号"],
     "授信额度": ["授信额度", "额度", "授信金额", "额度金额"],
     # 本次业务金额只对应来源明确的借款金额；绝不把授信额度当成提款金额。
-    "借款金额": ["借款金额", "本次业务金额", "本次借款金额"],
+    "借款金额": ["借款金额", "本次业务金额", "本次借款金额", "本次用信金额", "放款金额"],
     "额度期限": ["额度期限", "授信期限", "期限", "额度起止日期"],
     "贷款期限": ["贷款期限", "借款期限"],
     "合同金额": ["合同金额", "金额"],
@@ -119,6 +119,8 @@ def score_candidate(label: str, fact_key: str) -> float:
     而"是它的子串"只是巧合（0.82）。顺序反了会把真字段压到阈值以下，
     于是表单上明明有的格子被判成"没人认领"。
     """
+    # Printed monetary units describe representation, not a different field.
+    label = re.sub(r'[（(]\s*(?:人民币\s*)?(?:亿|万)?元\s*[）)]', '', label)
     # “担保人2”与“保证人2”是模板措辞差异，不是不同业务主体。
     a, b = (_norm(label).replace("担保人", "保证人").replace("担保方", "保证方"),
             _norm(fact_key).replace("担保人", "保证人").replace("担保方", "保证方"))
@@ -1079,11 +1081,15 @@ def _field_for_target(field: str, target_subject: dict, facts: dict[str, dict]) 
     if role not in ("借款人", "保证人"):
         return field
     prefix = role + (str(number) if role == "保证人" and number is not None else "")
+    if role == '保证人' and number is not None and re.match(r'(?:保证人|担保人)\d*', field) and re.search(r'(?:保证|担保)合同', field):
+        return re.sub(r'^(?:保证人|担保人)\d*', prefix, field)
+    if hint == '合同编号' and re.search(r'合同|协议', field):
+        return field
     if hint == "法定代表人证件号码":
         candidate = prefix + hint
         if role == "保证人" and number is None:
             return candidate
-    elif hint in ("名称", "法定代表人", "开户行及账号", "名称及证件号码", "法定代表人姓名及证件号码"):
+    elif hint:
         candidate = prefix + hint
         # A generic guarantor certificate can name no number while the
         # source evidence names 保证人1/2.  Keep the semantic target key so
@@ -1118,7 +1124,8 @@ def _missing_source_value_reason(field, value):
     return None
 
 
-def _target_fact(facts: dict[str, dict], field: str, entity_ids: list[int]) -> tuple[str, dict | None]:
+def _target_fact(facts: dict[str, dict], field: str, entity_ids: list[int], *,
+                 allow_business_reference: bool = True) -> tuple[str, dict | None]:
     """Resolve one template field, then one unique scoped synonym if needed."""
     meta = _meta_for_target_scope(facts.get(field), entity_ids)
     # The raw company fact ``保证人法定代表人=蔡某`` shares a human-facing
@@ -1142,7 +1149,7 @@ def _target_fact(facts: dict[str, dict], field: str, entity_ids: list[int]) -> t
     # identity-field ownership rule to an unambiguous contract/amount/term;
     # if the global key has multiple values, return its explicit ambiguity so
     # the planner asks instead of silently presenting it as missing.
-    business = _business_reference(field)
+    business = allow_business_reference and _business_reference(field)
     raw = facts.get(field)
     if business and raw is not None:
         if raw.get("_ambiguous") or raw.get("value") not in (None, ""):
@@ -1288,8 +1295,23 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
             if target_subject["role"] == "保证人" and target_subject.get("number") is None and subject_scope:
                 target_subject = {**target_subject, "entity_ids": [
                     eid for eid in target_subject["entity_ids"] if eid in subject_scope]}
-            effective_field = _field_for_target(field, target_subject, facts)
-            source_field, meta = _target_fact(facts, effective_field, target_subject["entity_ids"])
+            reference = rule['target'].get('template_reference')
+            reference_issue = None
+            if reference:
+                from .template_reference import resolve
+                effective_field = field
+                source_field = field
+                try:
+                    meta = resolve(store, tpl, rule['target'], reference, rule.get('label') or field)
+                except ValueError as exc:
+                    meta = None
+                    reference_issue = str(exc)
+            else:
+                effective_field = _field_for_target(field, target_subject, facts)
+                own_guarantee = (target_subject['role'] == '保证人' and
+                                 bool(re.search(r'(?:保证|担保)合同', effective_field)))
+                source_field, meta = _target_fact(facts, effective_field, target_subject["entity_ids"],
+                                                allow_business_reference=not own_guarantee)
             value = None if meta is None else meta.get("value")
             missing_reason = _missing_source_value_reason(effective_field, value)
             if missing_reason:
@@ -1305,10 +1327,12 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
             # Shape/unit incompatibility is local to this destination.  Keep
             # every other target in the batch flowing; this row can be blanked
             # or corrected with --new after the preview explains the problem.
-            local_issue = target_structure_issue(tpl, rule["target"])
+            local_issue = reference_issue or target_structure_issue(tpl, rule["target"])
             if local_issue is None and value is not None and str(value).strip():
                 local_issue = value_target_issue(tpl, rule["target"], str(value))
-            if ambiguous:
+            if reference_issue:
+                decision, ask = "ask", reference_issue
+            elif ambiguous:
                 # 🔴 库里这个键**属于多个主体**，而字段名又没指明是谁的 —— **不许替你挑**
                 who = "、".join("%s（%s）" % (c["entity_name"], c["value"]) for c in cands[:3])
                 decision, ask = "ask", (
@@ -1318,6 +1342,8 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
                 decision, ask = "empty", missing_reason or "源文件里没有这个值（缺失留空）"
             elif local_issue:
                 decision, ask = "ask", "填写位置与值的单位/类型不兼容：%s；可留空，或输入符合该位置的值" % local_issue
+            elif target_subject.get('additional_party'):
+                decision, ask = "ask", "源事实确定，但本合同额外签署方关系未确定；请确认是否采用该主体值或留空"
             elif role_blocked:
                 decision, ask = "ask", "这个主体的角色还没确认（🟡 提示级）"
             elif conf < AUTO_APPLY_THRESHOLD:
@@ -1341,6 +1367,13 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
                 "subject_eid": subject_eid, "subject_label": subject_label,
                 "subject_scope": subject_scope, "subject_note": subject_note,
                 "target_subject": target_subject,
+                "relationship_review": ({
+                    "block_id": target_subject.get('additional_party_block_id'),
+                    "owner_eid": (meta or {}).get('_relation_owner_eid') or (meta or {}).get('entity_id'),
+                    "owner_name": store.entity_label((meta or {}).get('_relation_owner_eid') or
+                                                     (meta or {}).get('entity_id')),
+                } if target_subject.get('additional_party') and value is not None
+                   and not local_issue and not ambiguous else None),
                 "qualified_source": bool((meta or {}).get('_qualified')),
                 "local_issue": local_issue,
                 "relation_owner_eid": (meta or {}).get('_relation_owner_eid'),
@@ -1738,11 +1771,13 @@ def _check_cross_subject(store: StoreV2, rows: list[dict]) -> dict:
 
 
 def _check_no_fabrication(rows: list[dict]) -> dict:
-    """红线二：每个值都必须说得出它是哪来的（source / computed / user）。"""
+    """Every filled value must retain a traceable source classification."""
     bad = []
     for r in rows:
         kind = r.get("_source_kind")
-        if kind not in ("source", "computed", "user"):
+        if kind not in ("source", "computed", "user") and not (
+                kind == "template_reference" and r.get("provenance") and
+                r.get("target", {}).get("template_reference")):
             bad.append({"field": r["field"], "template": r["template"],
                         "source_kind": kind})
     return {"ok": not bad, "bad": bad}
@@ -2000,7 +2035,7 @@ def cmd_db_fill(args) -> Result:
                     payload={"why": "value_without_origin", "bad": fabric["bad"]})
         store.set_run_status(run_id, "blocked", "value_without_origin")
         store.close()
-        raise OfficeKitError("🔴 红线二：有值说不出来源，拒绝填充：%s" % fabric["bad"])
+        raise OfficeKitError("字段缺少可追溯来源：%s" % fabric["bad"])
 
     # 字段归属诊断：逐位置已在预演中解析主体；旧的粗粒度角色检查只作
     # 报告，不能因公司→法定代表人的明确关系事实而停止整批填充。

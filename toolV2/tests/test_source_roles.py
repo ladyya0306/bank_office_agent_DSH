@@ -134,15 +134,17 @@ class SourceRoleTests(unittest.TestCase):
         write_docx(self.target, "证件信息：")
         started = request(self.payload())
         self.assertEqual("awaiting_source", started["status"], started)
-        pair_questions = [q for q in started["questions"]
-                          if "TAIWAN-PASS-001" in q["question"] or
-                          "PASSPORT-001" in q["question"]]
-        self.assertEqual(2, len(pair_questions), started["questions"])
-        self.assertEqual(1, sum("TAIWAN-PASS-001" in q["question"] for q in pair_questions))
-        self.assertEqual(1, sum("PASSPORT-001" in q["question"] for q in pair_questions))
-        self.assertTrue(all(self.source.name in q["question"] for q in pair_questions))
-        generic_question = next(q for q in started["questions"] if "GENERIC-001" in q["question"])
-        self.assertNotIn("居民身份证", generic_question["question"])
+        ownership_questions = [q for q in started["questions"]
+                               if q["header"].startswith("材料归属")]
+        # Both documents have direct owners.  Their same-owner different
+        # values can still correctly form one conflict card, but neither is
+        # an ownership confirmation card.
+        self.assertFalse(any("TAIWAN-PASS-001" in q["question"] or
+                             "PASSPORT-001" in q["question"]
+                             for q in ownership_questions))
+        conflict = next(q for q in started["questions"] if q["id"].startswith("source-conflict-"))
+        self.assertIn("GENERIC-001", conflict["question"])
+        self.assertNotIn("居民身份证", conflict["question"])
 
     def test_source_question_shows_file_original_quote_and_context_basis(self) -> None:
         write_docx(self.source, "联系电话：13800000000")

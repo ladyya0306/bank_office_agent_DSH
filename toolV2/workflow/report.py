@@ -89,14 +89,15 @@ def write(work, task, artifact_records=None):
             if row.get('kind') != 'slot' or int(row.get('n', -1)) not in blank_numbers:
                 continue
             where = location({'template': name, 'target': row['target'], 'label': row.get('label', row['field'])})
-            reason = row.get('local_issue') or ('来源没有建议值，用户确认留空'
+            reason = row.get('local_issue') or (row.get('ask_reason') if row.get('relationship_review') else None) or ('来源没有建议值，用户确认留空'
                                                  if row.get('value') in (None, '')
                                                  else '用户确认留空')
             lines.append(f'- 用户确认留空：{where}。原因：{reason}')
         for row in record.get('plan', {}).get('rows', []):
             if (row.get('kind') == 'slot' and row.get('value') in (None, '')
                     and int(row.get('n', -1)) not in blank_numbers):
-                lines.append(f"- 来源未给出建议值：{row.get('field')}，以用户确认结果为准。")
+                where = location({'template': name, 'target': row['target'], 'label': row.get('label', row['field'])})
+                lines.append(f"- 来源信息不完整，留空：{where}。{row.get('ask_reason') or '来源未给出该位置的值'}。")
         lines.append('')
     path = work / 'out' / task['batch'] / '_报告' / f"toolV2-{task['id']}-全部文件.md"
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -22,6 +22,19 @@ function validateEnvelope(response) {
   return response;
 }
 
+function partialUpdateResponse(response) {
+  if (!response?.success_with_rejected || !Array.isArray(response.rejected_updates)
+      || response.rejected_updates.length === 0) return null;
+  const templates = [...new Set(response.rejected_updates
+    .map((item) => item?.template).filter(Boolean))];
+  const scope = templates.length ? `仅修复被拒绝的模板：${templates.join('、')}。` : '仅修复被拒绝的位置。';
+  return {
+    ...response,
+    error: response.error || `部分位置更新被拒绝；${scope}已成功的模板和产物已保留，无需重复提交。`,
+    next_action: response.next_action || `${scope}请根据 rejected_updates 中的原因修改后，使用同一 task_id 重新提交；不要重复提交已成功内容。`,
+  };
+}
+
 function preserveTaskContext(response, fallback = {}) {
   const taskId = response.task_id || fallback.task_id;
   const work = response.work || fallback.work;
@@ -75,6 +88,11 @@ function addTaskId(error, taskId) {
   return wrapped;
 }
 
+function interactionUnavailable(error) {
+  return /human interaction is unavailable while the calling agent is owned by another live agent/i
+    .test(error?.message || String(error));
+}
+
 /** Drive only the fixed office.py JSON protocol; all effects are injected for testing. */
 export async function runOfficeFill(args, { ask, run, signal }) {
   if (args.mapping_read) {
@@ -95,6 +113,8 @@ export async function runOfficeFill(args, { ask, run, signal }) {
       });
   } catch (error) { throw addTaskId(error, args.task_id); }
   const askedVersions = new Set();
+  const partial = partialUpdateResponse(response);
+  if (partial) return partial;
   if (!response.ok && response.status !== 'failed') {
     throw new Error(response.error || '填表任务执行失败');
   }
@@ -105,7 +125,8 @@ export async function runOfficeFill(args, { ask, run, signal }) {
       const key = JSON.stringify([response.work || args.work, response.task_id]);
       const previous = mappingRevisions.get(key);
       if (previous !== undefined && previous === revision) {
-        throw new Error(`任务 ${response.task_id} 的位置修复没有推进（mapping_revision 未变化），请先核对 mapping_requests 后再恢复`);
+        response = { ...response, mapping_update_unchanged: true,
+          next_action: '本次位置与已保存内容相同，已复用现有状态；继续处理 mapping_requests 中的剩余位置，无需重复提交已完成项。' };
       }
       mappingRevisions.set(key, revision);
       // This is a convenience guard, not an approval store. Keep it bounded.
@@ -152,6 +173,18 @@ export async function runOfficeFill(args, { ask, run, signal }) {
           || error?.message === 'the user cancelled ask_user_question') {
         return cancelled();
       }
+      if (interactionUnavailable(error)) {
+        // A child agent cannot display its owner's native question.  The
+        // workflow state is already saved; hand the exact unresolved response
+        // back to the parent instead of inventing answers or throwing away
+        // task/results/questions in a generic exception.
+        return {
+          ...response,
+          interaction_required: true,
+          error: '当前子代理无法显示原生提问；任务和未解决问题已保留。',
+          next_action: '请由主代理使用同一 task_id 恢复此任务并显示 questions，提交使用者的原生回答；不要让子代理代答或重复提交已完成内容。',
+        };
+      }
       throw addTaskId(error, response.task_id);
     }
     let answers;
@@ -168,6 +201,8 @@ export async function runOfficeFill(args, { ask, run, signal }) {
         work: response.work, batch: response.batch };
       throw addTaskId(error, response.task_id);
     }
+    const partial = partialUpdateResponse(response);
+    if (partial) return partial;
     if (!response.ok && response.status !== 'failed') {
       throw new Error(response.error || '填表任务执行失败');
     }

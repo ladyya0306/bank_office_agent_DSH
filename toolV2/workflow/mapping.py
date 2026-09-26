@@ -1,5 +1,6 @@
 """Expose concrete template gaps so the model maps facts, not hand-written code."""
 import re
+import hashlib
 from office_kit import doc_fill
 from office_kit.common import OfficeKitError
 from office_kit.store_v2 import sha256_file
@@ -7,7 +8,15 @@ from office_kit.harness import candidates_for
 from office_kit.template_slots import discover_slots
 from office_kit.target_validation import validate_target, read_word_template, read_excel_template
 
-SLOT_DISCOVERY_VERSION = 5
+SLOT_DISCOVERY_VERSION = 8
+
+
+class MappingUpdateError(ValueError):
+    """Identify the actual failed proposal inside an atomic template update."""
+    def __init__(self, message, item, slot=None):
+        super().__init__(message)
+        self.slot_id = item.get('slot_id')
+        self.label = (slot or {}).get('label') or item.get('label')
 
 
 def contains(outer, inner):
@@ -56,6 +65,8 @@ def physical(path, target, engine=None):
 
 def inspect(store, path, record, facts):
     """Every discovered writable position is filled, expressly blank, or exposed."""
+    from office_kit.fact_catalog import target_subject_context
+
     if (record.get('slot_hash') != sha256_file(path)
             or record.get('slot_version') != SLOT_DISCOVERY_VERSION):
         record['slots'] = discover_slots(path)
@@ -77,7 +88,19 @@ def inspect(store, path, record, facts):
         positions = physical(path, slot['target'], engine)
         if positions and all(any(contains(c, p) for c in covered) for p in positions):
             continue
-        missing.append({**slot, 'candidates': scoped_candidates(store, path, slot, facts)[:4]})
+        subject = target_subject_context(store, path, slot['target'],
+                                         label=slot.get('label', ''),
+                                         context=slot.get('context'))
+        target_subject = {
+            'role': subject.get('role'),
+            'number': subject.get('number'),
+            'additional_party': bool(subject.get('additional_party')),
+            'reason': subject.get('reason'),
+            'field_hint': subject.get('field_hint'),
+            'entity_names': [store.entity_label(eid) for eid in subject.get('entity_ids', [])],
+        }
+        missing.append({**slot, 'target_subject': target_subject,
+                        'candidates': scoped_candidates(store, path, slot, facts)[:4]})
     record['unmapped_slots'] = missing
     record['coverage'] = {'detected': len(record['slots']), 'unmapped': len(missing),
                           'protected': sum(bool(s.get('protected')) for s in record['slots']),
@@ -97,12 +120,15 @@ def visible_slot(slot):
     """Keep one useful excerpt, not repeated full paragraphs and fact payloads."""
     target = slot['target']
     context = dict(slot.get('context', {}))
+    subject = slot.get('target_subject') or {}
     if 'expected_text' in target:
         raw = target['expected_text']
         start, end = target['span_start'], target['span_end']
         context['paragraph'] = raw[max(0, start-160):start] + '【填写处】' + raw[end:end+160]
     return {'id': slot['id'], 'label': slot.get('label'),
             'context': {key: value[:360] for key, value in context.items()},
+            'target_subject': {key: subject.get(key) for key in
+                               ('role', 'number', 'additional_party', 'reason', 'field_hint', 'entity_names')},
             'target': {key: value for key, value in target.items() if key != 'expected_text'},
             'candidates': [{'field': c['field'], 'score': c['score']}
                            for c in slot.get('candidates', [])[:3]],
@@ -118,11 +144,26 @@ def semantic_compatible(field, slot):
     from the visible position text rather than template names or coordinates.
     """
     target = slot.get('target', {})
-    text = ' '.join(str(value) for value in (
-        target.get('expected_text', ''), *(slot.get('context', {}) or {}).values()) if value)
-    if re.search(r'会议(?:时间|日期)', text) and re.search(r'期限', field):
+    if target.get('template_reference'):
+        return True  # The shared resolver checks the exact source/target label.
+    raw = str(target.get('expected_text', ''))
+    before = raw[:int(target.get('span_start', 0))]
+    if re.search(r'(?:合同编号|编号为)[^，。；;（）()]{0,40}$', before) and not re.search(r'合同|协议', field):
         return False
-    if re.search(r'(?:品种|份数)', text) and re.search(r'合同|协议|编号', field):
+    # Semantic guarding is position-local.  Paragraph/table context can
+    # describe a neighbouring blank, so it must not reject a valid contract
+    # number merely because another field in that context says “品种”.
+    start, end = int(target.get('span_start', 0)), int(target.get('span_end', 0))
+    # A paragraph can have both “合同编号：____；品种：____”.  Limit the
+    # guard to this blank's clause, rather than letting the second blank's
+    # label reject the first one.
+    before_clause = re.split(r'[；;。\n]', str(target.get('expected_text', ''))[:start])[-1]
+    after_clause = re.split(r'[；;。\n]', str(target.get('expected_text', ''))[end:])[0]
+    local_text = ' '.join(str(value) for value in
+                          (slot.get('label', ''), before_clause[-80:], after_clause[:80]) if value)
+    if re.search(r'会议(?:时间|日期)', local_text) and re.search(r'期限', field):
+        return False
+    if re.search(r'(?:品种|份数)', local_text) and re.search(r'合同|协议|编号', field):
         return False
     return True
 
@@ -133,6 +174,8 @@ def scoped_candidates(store, path, slot, facts):
     from office_kit.harness import score_candidate
     scope = target_subject_context(store, path, slot['target'], label=slot.get('label', ''),
                                    context=slot.get('context'))
+    if scope.get('additional_party'):
+        return []
     identities = {}
     target = slot['target']
     raw = str(target.get('expected_text') or '')
@@ -148,6 +191,13 @@ def scoped_candidates(store, path, slot, facts):
         if meta.get('_ambiguous'):
             continue
         score = score_candidate(slot.get('label', ''), field)
+        hint = scope.get('field_hint')
+        prefix = (scope.get('role') or '') + (str(scope['number']) if scope.get('number') is not None else '')
+        # The same position-local meaning used by the fill planner must also
+        # inform first-time mapping; otherwise clear name/ID slots wait for a
+        # model to recreate the relationship the parser has already resolved.
+        if hint and scope['entity_ids'] and (field == prefix + hint or meta.get('_base_field') == hint):
+            score = 1.0
         if contract_title and re.sub(r'^(借款人|保证人|担保人)\d*', '', field) == contract_title:
             score = 1.0
         if meta.get('_base_field'):
@@ -182,7 +232,8 @@ def _retire_semantic_mismatch(store, path, record, batch):
                            if intersects(position, physical(path, slot['target'], engine))]
             except (OfficeKitError, KeyError, IndexError, ValueError, TypeError):
                 matches = []
-            if matches and any(not semantic_compatible(rule['field'], slot) for slot in matches):
+            if matches and any(slot.get('protected') or (not target.get('template_reference') and
+                               not semantic_compatible(rule['field'], slot)) for slot in matches):
                 removed = True
             else:
                 kept.append(target)
@@ -190,6 +241,47 @@ def _retire_semantic_mismatch(store, path, record, batch):
             continue
         store.disable_rule(path, rule['field'], rule['target'],
                            '当前位置语义与来源字段不兼容，停用旧映射并保留历史')
+        if kept:
+            replacement = kept[0] if len(kept) == 1 else {'kind': 'multi', 'targets': kept}
+            store.add_rule(rule['template_id'], rule['field'], rule['label'], replacement,
+                           confidence=rule['confidence'], decided_by=rule['decided_by'], batch_no=batch)
+
+
+def _retire_unbound_additional_party_auto_rules(store, path, record, batch):
+    """Remove only prior automatic guesses in optional signer blocks.
+
+    User/model rules remain editable and usable: this migration corrects the
+    former automatic borrower-copy behavior without treating an optional block
+    as a protected or permanently unfillable position.
+    """
+    from office_kit.fact_catalog import target_subject_context
+
+    engine = read_word_template(path) if path.suffix.lower() == '.docx' else None
+    slots = record.get('slots', [])
+    for rule in list(store.rules_for(path)):
+        if rule.get('decided_by') != 'auto':
+            continue
+        children = rule['target'].get('targets', [rule['target']])
+        kept, removed = [], False
+        for target in children:
+            try:
+                position = physical(path, target, engine)
+                matches = [slot for slot in slots
+                           if intersects(position, physical(path, slot['target'], engine))]
+                additional = any(target_subject_context(store, path, slot['target'],
+                                                        label=slot.get('label', ''),
+                                                        context=slot.get('context')).get('additional_party')
+                                 for slot in matches)
+            except (OfficeKitError, KeyError, IndexError, ValueError, TypeError):
+                additional = False
+            if additional:
+                removed = True
+            else:
+                kept.append(target)
+        if not removed:
+            continue
+        store.disable_rule(path, rule['field'], rule['target'],
+                           '可选签署方区块未声明主体；停用历史自动映射并保留历史')
         if kept:
             replacement = kept[0] if len(kept) == 1 else {'kind': 'multi', 'targets': kept}
             store.add_rule(rule['template_id'], rule['field'], rule['label'], replacement,
@@ -269,6 +361,7 @@ def auto_map(store, path, record, facts, batch):
     """Map unique source facts in the position's role; expose actual ambiguities."""
     inspect(store, path, record, facts)
     _retire_semantic_mismatch(store, path, record, batch)
+    _retire_unbound_additional_party_auto_rules(store, path, record, batch)
     _retire_obsolete_slots(store, path, record, batch)
     _refresh_value_cells(store, path, record, facts, batch)
     missing = inspect(store, path, record, facts)
@@ -303,6 +396,18 @@ def compile_updates(store, work, task, updates):
         name = path.relative_to(work).as_posix()
         if name not in task['targets']:
             raise ValueError('只能修改当前任务的目标模板')
+        field = item.get('field')
+        reference = item.get('template_reference')
+        if reference and (field or item.get('leave_blank')):
+            raise ValueError('template_reference 不能与 field 或 leave_blank 同时提交')
+        if reference and not item.get('leave_blank'):
+            if (not isinstance(reference, dict) or set(reference) != {'sheet', 'cell'} or
+                    not isinstance(reference.get('sheet'), str) or not isinstance(reference.get('cell'), str) or
+                    not item.get('slot_id')):
+                raise ValueError('template_reference 需要同模板的 sheet 与 cell')
+            field = '模板引用:' + hashlib.sha256((reference['sheet'] + '!' + reference['cell']).encode()).hexdigest()[:16]
+        if not reference and not item.get('leave_blank') and field not in facts:
+            raise MappingUpdateError(f'来源中没有字段 {field!r}，请从 available_fields 中选择或明确留空', item)
         if task['documents'][name].get('slot_hash') != sha256_file(path):
             raise ValueError('目标文件已变化，请先继续原任务取得最新填写位置；此次没有修改规则')
         if not item.get('slot_id'):
@@ -312,10 +417,10 @@ def compile_updates(store, work, task, updates):
         slots = {s['id']: s for s in task['documents'][name].get('slots', [])}
         slot = slots.get(item['slot_id'])
         if slot is None:
-            raise ValueError(f'{name} 的空位已变化，请使用工具返回的当前 slot_id')
+            raise MappingUpdateError(f'{name} 未找到提交的 slot_id={item["slot_id"]}；请逐字使用 positions 返回的 id。不能据此判断其它位置已变化。', item)
         identity = (name, slot['id'])
         if identity in seen:
-            raise ValueError(f'{name} 的同一空位重复提交，未写入规则')
+            raise MappingUpdateError(f'{name} 的同一空位重复提交，未写入规则', item, slot)
         seen.add(identity)
         if item.get('leave_blank'):
             reason = str(item.get('reason') or '').strip()
@@ -324,11 +429,14 @@ def compile_updates(store, work, task, updates):
             blanks.append((name, slot['id'], reason))
             continue
         if slot.get('protected'):
-            raise ValueError('签字、签核位置不能通过填表映射自动代填')
-        field = item.get('field')
-        if field not in facts:
-            raise ValueError(f'来源中没有字段 {field!r}，请从 available_fields 中选择或明确留空')
+            raise MappingUpdateError('签字、签核位置不能通过填表映射自动代填', item, slot)
+        if not reference and not semantic_compatible(field, slot):
+            raise MappingUpdateError(f'位置 {slot["id"]}（{slot.get("label") or "未标注"}）与字段 {field} 语义不兼容；合同编号不能填写到合同品种或份数位置', item, slot)
         target = dict(slot['target'])
+        if reference:
+            from office_kit.template_reference import resolve
+            resolve(store, path, target, reference, slot.get('label') or '')
+            target['template_reference'] = {'sheet': reference['sheet'], 'cell': reference['cell']}
         target['slot_id'] = slot['id']
         validate_target(path, target)
         checked.append((path, {**item, 'field': field, 'target': target,

@@ -5,6 +5,7 @@ from pathlib import Path
 
 ACCEPT = '采用建议值（推荐）'
 BLANK = '留空'
+CONFIRM_PARTY = '确认该主体，采用来源资料'
 
 
 def _fact_catalog(task):
@@ -102,15 +103,36 @@ def questions(task):
                           row.get('value'), row.get('entity_name'), row.get('source_kind'),
                           row.get('ambiguous'), row.get('candidates'), local_issue,
                           (template, row.get('n')) if local_issue else None])
+            relationship = row.get('relationship_review')
+            if relationship:
+                key = digest([task['batch'], template, 'relationship',
+                              relationship['block_id'], relationship['owner_eid']])
             group = groups.setdefault(key, {'row': row, 'places': []})
             group['places'].append({'template': template, 'n': row['n'],
                                     'fingerprint': fingerprint(plan, row), 'target': row['target'],
+                                    **({'value': row.get('value')} if relationship else {}),
                                     'label': row.get('label', row['field'])})
     output = []
     task['question_groups'] = {}
     for group in groups.values():
         row = group['row']
         qid = 'fill-' + digest([task['batch'], group['places']])
+        relationship = row.get('relationship_review')
+        if relationship:
+            owner = relationship['owner_name']
+            places = [location(p) for p in group['places']]
+            suggestion = (f'来源已提供“{owner}”的资料，但尚未明确它是否是本合同的额外签署方。'
+                          '确认后各位置采用对应的来源值；否则本块留空。')
+            output.append({'id': qid, 'header': f"{group['places'][0]['template']}：额外签署方是否为{owner}",
+                           'question': suggestion, 'suggestion': suggestion,
+                           'detail': '<!--dsh-fill-locations:v1-->\n' + '\n'.join(
+                               f'- {location(p)}：{p["value"]}' for p in group['places']) +
+                               '\n本题只确认主体关系，不需要重新填写姓名、地址或证件资料。',
+                           'locations': places, 'risk': True, 'relationship_review': relationship,
+                           'options': [{'label': CONFIRM_PARTY, 'description': f'确认{owner}适用于本块全部{len(places)}处。'},
+                                       {'label': BLANK, 'description': '仅本额外签署方区块留空。'}]})
+            task['question_groups'][qid] = group
+            continue
         if row.get('local_issue'):
             options = []
         elif row.get('ambiguous'):
@@ -158,6 +180,10 @@ def validate(questions, answers):
         selected, custom = a.get('selected', []), a.get('custom', '')
         if not isinstance(custom, str) or not isinstance(selected, list):
             raise ValueError('回答格式无效')
+        relationship = expected[a['id']].get('relationship_review')
+        if relationship and custom.strip() and custom.strip() not in (
+                CONFIRM_PARTY, relationship['owner_name'], BLANK, '暂不填写', '先不填', '不知道', '不确定'):
+            raise ValueError('本题确认主体关系，请选择该主体或留空；各项资料会采用各自来源值')
         if not custom.strip() and (len(selected) != 1 or selected[0] not in
                                    {o['label'] for o in expected[a['id']]['options']}):
             raise ValueError('请选择一个选项或填写答案')
@@ -175,6 +201,10 @@ def save(task, answers):
             c, n = choices[place['template']], str(place['n'])
             if pick in (BLANK, '暂不填写', '先不填', '不知道', '不确定'):
                 c['blank'].append(n)
+            elif group['row'].get('relationship_review'):
+                if pick not in (CONFIRM_PARTY, group['row']['relationship_review']['owner_name']):
+                    raise ValueError('请选择本块对应的主体或留空')
+                c['select'] = ','.join(filter(None, [c['select'], n]))
             elif custom:
                 c['new'].append(f'{n}={custom}')
             elif group['row'].get('ambiguous'):
@@ -197,4 +227,5 @@ def execution_signature(plan):
     rows = [{k: r.get(k) for k in ('template_sha256', 'field', 'label', 'target', 'value',
                                    'entity_name', 'subject_eid', 'subject_scope', 'provenance', 'decision', 'candidates', 'source_kind')}
             for r in plan['rows']]
-    return digest([plan['batch_no'], rows, selections, missing])
+    return digest([plan['batch_no'], rows, selections, missing,
+                   *([plan['writer_version']] if plan.get('writer_version') is not None else [])])

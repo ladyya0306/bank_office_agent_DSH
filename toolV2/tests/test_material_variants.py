@@ -109,6 +109,19 @@ class MaterialVariantTests(unittest.TestCase):
         self.assertEqual("合成保证公司", amount["entity_name"])
         self.assertEqual("合成保证公司", term["entity_name"])
 
+    def test_guarantee_contract_title_binds_to_following_explicit_guarantor(self) -> None:
+        source = self.doc("guarantee-title-owner.docx", "最高额保证合同：CONTRACT-2",
+                          "保证人2：合成保证公司")
+        row = self.row(absorb(source), "最高额保证合同", "CONTRACT-2")
+        self.assertEqual("合成保证公司", row["entity_name"])
+        self.assertFalse(row["assumed"])
+
+    def test_unfollowed_guarantee_contract_title_stays_unassigned(self) -> None:
+        source = self.doc("unfollowed-guarantee-title.docx", "最高额保证合同：CONTRACT-2")
+        row = self.row(absorb(source), "最高额保证合同", "CONTRACT-2")
+        self.assertIsNone(row["entity_name"])
+        self.assertEqual("指明主体", row["needs"])
+
     def test_company_and_natural_person_document_values_do_not_cross_owners(self) -> None:
         source = self.doc("company-person.docx", "借款人：合成借款公司",
                           "统一社会信用代码：COMPANY-CREDIT", "保证人：合成个人保证人",
@@ -126,9 +139,7 @@ class MaterialVariantTests(unittest.TestCase):
         self.assertEqual("合成台籍个人", number["entity_name"])
         self.assertEqual(number["ownership_group"], certificate_type["ownership_group"])
         questions = source_questions(rows)
-        self.assertEqual(1, len(questions))
-        self.assertIn("TAIWAN-PASS-001", questions[0]["question"])
-        self.assertIn("台湾居民来往大陆通行证", questions[0]["question"])
+        self.assertEqual([], questions)
 
     def test_bank_and_account_in_one_field_are_preserved_with_owner(self) -> None:
         source = self.doc("bank-account.docx", "借款人：合成借款公司",

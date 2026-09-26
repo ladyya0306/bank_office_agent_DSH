@@ -15,7 +15,7 @@ let questionsAsked = 0;
 apply({ tools: { register: (definition) => { tool = definition; } },
   userQuestions: { ask: async ({ questions }) => {
     questionsAsked += questions.length;
-    return { answers: questions.map(q => ({ id: q.id, selected: [q.options[0].label], custom: '' })) };
+    return { answers: questions.map(q => ({ id: q.id, selected: [q.options.find(o=>o.label.startsWith('归属：合成企业'))?.label || q.options[0].label], custom: '' })) };
   } } }, { toolRoot: root, python });
 
 function pythonRun(script, args) {
@@ -31,7 +31,7 @@ try {
     const work = i === 0 ? cwd : path.join(cwd, '另选的办公区');
     await mkdir(work, { recursive: true });
     const value = `98765432${i}`;
-    pythonRun('import sys\nfrom pathlib import Path\nfrom docx import Document\np=Path(sys.argv[1])\n(p/"原始资料").mkdir()\n(p/"待填写表格").mkdir()\nd=Document()\nd.add_paragraph("借款人：合成企业")\nd.add_paragraph("收款账号："+sys.argv[2])\nd.save(p/"原始资料"/"材料.docx")\nd=Document()\nd.add_paragraph("收款账号：")\nd.save(p/"待填写表格"/"目标.docx")', [work, value]);
+    pythonRun('import sys\nfrom pathlib import Path\nfrom docx import Document\np=Path(sys.argv[1])\n(p/"原始资料").mkdir()\n(p/"待填写表格").mkdir()\nd=Document()\nd.add_paragraph("收款账号："+sys.argv[2])\nd.add_paragraph("借款人：合成企业")\nd.save(p/"原始资料"/"材料.docx")\nd=Document()\nd.add_paragraph("收款账号：")\nd.save(p/"待填写表格"/"目标.docx")', [work, value]);
     const args = { work, source: [path.join(work, '原始资料', '材料.docx')],
       targets: [path.join(work, '待填写表格', '目标.docx')], batch: '20260925-01' };
     const before = questionsAsked;

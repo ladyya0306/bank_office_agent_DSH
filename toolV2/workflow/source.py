@@ -8,7 +8,13 @@ from . import source_conflicts
 # keep an older parser's ownership suggestions. Answer identities stay separate.
 # v5: numbered guarantor sections retain their own current owner instead of
 # letting a later “保证人2” overwrite the fields following “保证人1”.
-SOURCE_PARSE_VERSION = 5
+# v6: an explicit legal representative owns the immediately following
+# certificate; a guarantee-contract heading may bind to its following named
+# guarantor without assigning unrelated fields across the boundary.
+# v7: a directly declared natural-person guarantor owns the immediately
+# following certificate as well; source-question headings include that
+# declared role/name when a question still remains.
+SOURCE_PARSE_VERSION = 7
 # Parser refresh must not erase unchanged user decisions. Evidence/ownership
 # changes already produce different identities; retain the prior answer schema.
 SOURCE_ANSWER_VERSION = 3

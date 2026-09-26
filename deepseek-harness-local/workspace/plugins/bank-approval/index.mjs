@@ -34,6 +34,9 @@ const FREE_TOOLS = new Set([
   'ralph', 'exit_plan_mode',
 ]);
 
+/** Known workspace-scoped office operation; its own resolver/input checks remain authoritative. */
+const OFFICE_TASK_TOOLS = new Set(['office_fill_task']);
+
 /** 写文件的工具：一律批准。 */
 const FILE_TOOLS = new Set(['write', 'edit', 'str_replace', 'create_file', 'str_replace_editor']);
 
@@ -203,6 +206,10 @@ function short(text, limit) {
 function classify(toolName, args, cwd) {
   const tool = String(toolName || '').toLowerCase();
   const a = args && typeof args === 'object' ? args : {};
+
+  // The dedicated office tool already validates its work root, inputs, native
+  // data state, and output locations. Do not add a second, per-session approval.
+  if (OFFICE_TASK_TOOLS.has(tool)) return { kind: 'next' };
 
   if (FREE_TOOLS.has(tool)) return { kind: 'next' };
 

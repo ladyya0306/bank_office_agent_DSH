@@ -51,6 +51,8 @@ test('timeout and cancellation stop a synthetic Python parent and child process'
       await readFile(path.join(toolRoot, 'dsh-plugin', 'index.mjs')));
     await writeFile(path.join(pluginCopy, 'controller.mjs'),
       await readFile(path.join(toolRoot, 'dsh-plugin', 'controller.mjs')));
+    await writeFile(path.join(pluginCopy, 'render.mjs'),
+      await readFile(path.join(toolRoot, 'dsh-plugin', 'render.mjs')));
     const { runOfficePython } = await import(`${pathToFileURL(path.join(pluginCopy, 'index.mjs')).href}?test=${Date.now()}`);
     const pidFile = path.join(fixtureRoot, 'pids.json');
     const pythonSource = [

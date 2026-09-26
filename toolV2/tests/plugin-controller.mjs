@@ -52,6 +52,19 @@ test('cancel returns only the resumable task identity, never synthetic answers',
   assert.equal(calls[1].answers, undefined);
 });
 
+test('child interaction ownership error returns the unresolved response to its parent', async () => {
+  let runs = 0;
+  const result = await runOfficeFill({ work: 'work', source: ['in.xlsx'], targets: ['out.xlsx'] }, {
+    ask: async () => { throw new Error('human interaction is unavailable while the calling agent is owned by another live agent; include the unresolved question or decision in the child agent\'s final result'); },
+    run: async () => { runs += 1; return pending('awaiting_fill', 'fill-1'); },
+  });
+  assert.equal(runs, 1);
+  assert.equal(result.status, 'awaiting_fill');
+  assert.equal(result.interaction_required, true);
+  assert.equal(result.questions[0].id, 'fill-1');
+  assert.match(result.next_action, /主代理/);
+});
+
 test('recognizes DSH cancellation error without swallowing unrelated ask errors', async () => {
   const result = await runOfficeFill({ work: 'work', source: ['in.xlsx'], targets: ['out.xlsx'] }, {
     ask: async () => { throw new Error('the user cancelled ask_user_question'); },
@@ -157,13 +170,37 @@ test('allows a first mapping response that still needs mapping', async () => {
       mapping_revision: 'r1' }),
   });
   assert.equal(result.status, 'needs_mapping');
-  await assert.rejects(() => runOfficeFill({ work: 'work', task_id: 'task-mapping', rule_updates: [{
+  const repeated = await runOfficeFill({ work: 'work', task_id: 'task-mapping', rule_updates: [{
     template: 'out.xlsx', field: '日期', target: { sheet: 'Sheet1', cell: 'B2' },
   }] }, {
     ask: async () => answer(), run: async () => ({ ok: true, status: 'needs_mapping',
       task_id: 'task-mapping', work: 'work', batch: 'b1', questions: [], results: [],
       mapping_revision: 'r1' }),
-  }), /mapping_revision 未变化/);
+  });
+  assert.equal(repeated.status, 'needs_mapping');
+  assert.equal(repeated.mapping_update_unchanged, true);
+  assert.match(repeated.next_action, /剩余位置/);
+});
+
+test('returns a partial rejected update with artifacts and a narrow next action', async () => {
+  let asked = 0;
+  const response = { ok: false, status: 'completed', success_with_rejected: true,
+    task_id: 'task-1', work: 'work', batch: 'b1', questions: [],
+    results: [{ file: 'kept.xlsx' }], rejected_updates: [{
+      template: 'bad.xlsx', reason: '来源中没有字段', updates: [{ field: '虚构字段' }],
+    }] };
+  const result = await runOfficeFill({ work: 'work', task_id: 'task-1', rule_updates: [{
+    template: 'bad.xlsx', field: '虚构字段', target: { sheet: 'Sheet1', cell: 'B2' },
+  }] }, {
+    ask: async () => { asked += 1; return answer(); }, run: async () => response,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(result.results, [{ file: 'kept.xlsx' }]);
+  assert.equal(result.rejected_updates[0].template, 'bad.xlsx');
+  assert.match(result.error, /部分位置更新被拒绝/);
+  assert.match(result.next_action, /bad.xlsx/);
+  assert.equal(asked, 0);
 });
 
 test('recovery that returns the same unanswered question fails without asking twice', async () => {

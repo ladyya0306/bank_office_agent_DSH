@@ -139,6 +139,28 @@ class AutomaticReviewTests(unittest.TestCase):
             self.assertEqual('completed',upgraded['status'])
             self.assertEqual(1,upgraded['results'][0]['coverage']['left_blank'])
 
+    def test_new_source_fact_reopens_only_missing_data_blank(self):
+        from workflow.runner import dispatch
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            doc = Document(); doc.add_paragraph('借款人：合成甲公司'); doc.save(work/'source.docx')
+            doc = Document(); doc.add_paragraph('联系电话：____'); doc.save(work/'target.docx')
+            result = dispatch({'action':'start','work':tmp,'source':['source.docx'],
+                               'targets':['target.docx'],'batch':'20260926-79'})
+            self.assertEqual('needs_mapping', result['status'])
+            slot = result['mapping_requests'][0]['positions'][0]
+            blanked = dispatch({'action':'update_positions','work':tmp,'task_id':result['task_id'],
+                                'updates':[{'template':'target.docx','slot_id':slot['id'],
+                                            'leave_blank':True,'reason':'来源未提供联系电话'}]})
+            self.assertEqual('completed', blanked['status'])
+            doc = Document(); doc.add_paragraph('借款人：合成甲公司'); doc.add_paragraph('联系电话：13800000000')
+            doc.save(work/'source.docx')
+            reopened = dispatch({'action':'start','work':tmp,'source':['source.docx'],
+                                 'targets':['target.docx'],'batch':'20260926-79'})
+            self.assertEqual('completed', reopened['status'], reopened)
+            self.assertEqual(0, reopened['results'][0]['coverage']['left_blank'])
+            self.assertIn('13800000000', Document(reopened['results'][0]['output']).paragraphs[0].text)
+
 
 if __name__ == '__main__':
     unittest.main()

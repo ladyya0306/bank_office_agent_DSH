@@ -33,11 +33,18 @@ assert.equal(pre(tool(first, 'a2', 'edit', { path: 'D:\\office\\case-a\\two.txt'
 assert.equal(pre(tool(other, 'b1', 'write', { path: 'D:\\office\\case-b\\one.txt' }), next).kind, 'ask');
 assert.equal(pre(tool(first, 'a3', 'pwsh', { command: 'python run.py' }), next).kind, 'ask');
 assert.equal(pre(tool(first, 'a4', 'pwsh', { command: 'python -c "print(1)"' }), next).kind, 'deny');
+assert.equal(pre(tool(first, 'a6', 'office_fill_task',
+  { action: 'prepare', work: 'D:\\office\\case-a' }), next).kind, 'allow');
+const unknown = pre(tool(first, 'a7', 'unlisted_custom_tool', { value: 'x' }), next);
+assert.equal(unknown.kind, 'ask');
+assert.match(unknown.reason, /没有登记过的工具/);
 assert.equal(first.events[0].type, 'approval/policy');
 assert.deepEqual(first.events[0].data.bankGrant,
   { scope: '写文件', cwd: first.header.cwd, callId: 'a1' });
 policy = 'never';
 assert.equal(pre(tool(first, 'a5', 'write', { path: 'D:\\office\\case-a\\three.txt' }), next).kind, 'deny');
+assert.equal(pre(tool(first, 'a8', 'office_fill_task',
+  { action: 'prepare', work: 'D:\\office\\case-a' }), next).kind, 'allow');
 console.log('bank-approval: 允许一次 / 本会话同类一直允许 / 跨会话隔离 / 禁止清单 / never 策略通过');
 
 // 真正的 DSH 会话记录要接受授权事件，并能从记录重建同会话授权。

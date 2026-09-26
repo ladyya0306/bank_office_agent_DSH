@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+import sqlite3
 
 from docx import Document
 
@@ -142,6 +143,58 @@ class MappingWorkflowTests(unittest.TestCase):
         doc = Document(Path(completed["results"][0]["output"]))
         self.assertIn("甲代表", doc.paragraphs[0].text)
         self.assertIn("乙代表", doc.paragraphs[1].text)
+
+    def test_invalid_template_update_does_not_discard_other_template_update(self) -> None:
+        source = self.source("借款人：合成甲公司", "联系电话：13800000000")
+        good = self.target("客户电话：____", name="good.docx")
+        bad = self.target("未知信息：____", name="bad.docx")
+        result = self.answer_sources(request({"action": "start", "work": str(self.work),
+                                               "source": [source.name],
+                                               "targets": [good.name, bad.name],
+                                               "batch": "20260925-83"}))
+        self.assertEqual("needs_mapping", result["status"], result)
+
+        def first_slot(template: str) -> dict:
+            page = request({"action": "read_mapping", "work": str(self.work),
+                            "task_id": result["task_id"],
+                            "mapping_read": {"section": "positions", "template": template}})
+            return page["mapping_page"]["items"][0]
+
+        good_slot, bad_slot = first_slot(good.name), first_slot(bad.name)
+        updated = request({"action": "update_positions", "work": str(self.work),
+                           "task_id": result["task_id"], "updates": [
+                               {"template": good.name, "slot_id": good_slot["id"], "field": "联系电话"},
+                               {"template": bad.name, "slot_id": bad_slot["id"], "field": "不存在的来源字段"},
+                           ]})
+        self.assertEqual("needs_mapping", updated["status"], updated)
+        self.assertFalse(updated["ok"], updated)
+        self.assertTrue(updated["success_with_rejected"], updated)
+        self.assertEqual(1, len(updated.get("rejected_updates", [])), updated)
+        self.assertEqual(bad.name, updated["rejected_updates"][0]["template"])
+        conn = sqlite3.connect(self.work / "db" / "workflow.db")
+        try:
+            fields = [row[0] for row in conn.execute(
+                "SELECT r.field FROM template_rule r JOIN template t ON t.id=r.template_id "
+                "WHERE t.path=?", (str(good),))]
+        finally:
+            conn.close()
+        self.assertIn("联系电话", fields)
+
+    def test_invalid_legacy_target_update_keeps_completed_artifact_without_rerun(self) -> None:
+        source = self.source("借款人：合成甲公司", "联系电话：13800000000")
+        target = self.target("联系电话：____")
+        completed = self.finish_fill(self.answer_sources(self.start(source, target, "20260925-84")))
+        self.assertEqual("completed", completed["status"], completed)
+        rejected = request({"action": "update_positions", "work": str(self.work),
+                            "task_id": completed["task_id"], "updates": [{
+                                "template": target.name, "field": "不存在的来源字段",
+                                "target": {"kind": "anchor", "anchor": "联系电话：", "max_blank": 20},
+                            }]})
+        self.assertEqual("completed", rejected["status"], rejected)
+        self.assertFalse(rejected["ok"], rejected)
+        self.assertTrue(rejected["success_with_rejected"], rejected)
+        self.assertEqual(completed["counters"], rejected["counters"])
+        self.assertIn("来源中没有字段", rejected["rejected_updates"][0]["reason"])
 
 
 if __name__ == "__main__":

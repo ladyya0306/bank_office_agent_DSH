@@ -185,8 +185,9 @@ def test_generic_guarantor_representative_inherits_nearest_number_but_own_hint(t
                                          {"kind": "anchor", "part": "word/document.xml",
                                           "paragraph_index": 1,
                                           "expected_text": "担保人法定代表人或授权代理人身份证号：",
-                                          "span_start": 17, "span_end": 17})
-        assert (context["role"], context["number"], context["field_hint"]) == ("保证人", 2, "法定代表人")
+                                          "span_start": len("担保人法定代表人或授权代理人身份证号："),
+                                          "span_end": len("担保人法定代表人或授权代理人身份证号：")})
+        assert (context["role"], context["number"], context["field_hint"]) == ("保证人", 2, "法定代表人证件号码")
         assert context["entity_ids"] == [company_two]
     finally:
         store.close()

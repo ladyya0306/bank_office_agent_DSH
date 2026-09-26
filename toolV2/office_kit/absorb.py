@@ -212,9 +212,11 @@ def absorb_with_diagnostics(path: Path) -> tuple[list[dict[str, Any]], list[dict
     numbered_guarantors: dict[str, str] = {}
     last_company_role: str | None = None  # 最近一次出现的主体角色（借款人或保证人）
     last_company_owner: str | None = None # 最近明确主体；不能被“保证人”角色桶覆盖
+    last_company_label: str | None = None # 原文角色标签，供提问卡清楚说明编号保证人
     last_natural_person: dict[str, str] | None = None
     section_kind: str | None = None
     section_context: str | None = None
+    pending_guarantee_titles: list[int] = []
 
     def add_row(**row: Any) -> None:
         row["n"] = len(rows) + 1
@@ -248,20 +250,28 @@ def absorb_with_diagnostics(path: Path) -> tuple[list[dict[str, Any]], list[dict
         # 合同标题是有限的段落边界信号。保证合同不能沿用上一个主体；贷款/授信
         # 合同可回到材料已明确的借款人。标题本身不当作一个待入库字段。
         if "保证合同" in section_label:
+            # A contract number often appears in the heading immediately
+            # before the form declares its guarantor.  Keep only that title
+            # pending for the next explicit guarantor; do not let ordinary
+            # addresses/phones cross this contract boundary.
+            pending_guarantee_titles.clear()
             last_company_role = None
             last_company_owner = None
+            last_company_label = None
             last_natural_person = None
             section_kind = "保证合同"
             section_context = "当前材料段为保证合同，尚未识别保证主体"
         elif "流动资金贷款合同" in section_label or "借款合同" in section_label or "贷款合同" in section_label:
             last_company_role = "借款人" if role_owner.get("借款人") else None
             last_company_owner = role_owner.get("借款人")
+            last_company_label = "借款人" if last_company_owner else None
             last_natural_person = None
             section_kind = "贷款合同"
             section_context = "当前材料段为贷款合同"
         elif "授信合同" in section_label or "授信协议" in section_label:
             last_company_role = "借款人" if role_owner.get("借款人") else None
             last_company_owner = role_owner.get("借款人")
+            last_company_label = "借款人" if last_company_owner else None
             last_natural_person = None
             section_kind = "授信合同"
             section_context = "当前材料段为授信合同"
@@ -307,9 +317,17 @@ def absorb_with_diagnostics(path: Path) -> tuple[list[dict[str, Any]], list[dict
                 numbered_guarantors[number] = value
             last_company_role = role
             last_company_owner = value
+            last_company_label = raw_label
             last_natural_person = None
             if section_kind == "保证合同" and role == "保证人":
                 section_context = "当前保证合同段已明确保证主体"
+                for row_index in pending_guarantee_titles:
+                    pending = rows[row_index]
+                    pending.update(entity_name=value, owner_kind="subject",
+                                   context=("保证合同标题在第%d行，后续材料明确声明保证人“%s”"
+                                            % (pending["line"], value)),
+                                   confidence=1.0, needs="收", assumed=False)
+                pending_guarantee_titles.clear()
             add_row(line=n, label=raw_label, key=role + "名称", value=value, quote=quote,
                     entity_name=value, kind="主体", role=role, owner_kind="subject",
                     context="材料明确声明该主体为%s" % role, confidence=1.0, needs="收",
@@ -356,12 +374,21 @@ def absorb_with_diagnostics(path: Path) -> tuple[list[dict[str, Any]], list[dict
                 owner_kind = "person"
                 relation = last_natural_person["company"] or "未标明主体"
                 context = "紧随法定代表人“%s”（关联主体：%s）的证件信息" % (owner, relation)
-                assumed = True
+                # The immediately preceding legal-representative declaration
+                # explicitly links this person to a named company.  Treat the
+                # following certificate as source evidence, not an inferred
+                # ownership question.  A bare legal-representative name still
+                # has no company relation and remains for confirmation.
+                assumed = not bool(last_natural_person["company"])
             elif last_company_role and owner_for_role(last_company_role):
                 owner = owner_for_role(last_company_role)
                 owner_kind = "subject"
                 context = "紧随最近明确的%s“%s”段，未见新的法定代表人" % (last_company_role, owner)
-                assumed = True
+                # A named borrower/guarantor (including a natural-person
+                # guarantor) is direct source ownership for the immediately
+                # following certificate.  Contract headings reset this state,
+                # so it cannot leak into the next agreement section.
+                assumed = not bool(last_company_owner)
         else:
             target_role = explicit_role or last_company_role
             if target_role and owner_for_role(target_role):
@@ -387,7 +414,11 @@ def absorb_with_diagnostics(path: Path) -> tuple[list[dict[str, Any]], list[dict
                 needs="收" if owner and not assumed else "默认" if owner else "指明主体",
                 assumed=assumed, known_key=(raw_label in LABEL_ALIASES or
                                              is_certificate_number or is_certificate_type),
-                ownership_group=ownership_group, certificate_type=certificate_type)
+                ownership_group=ownership_group, certificate_type=certificate_type,
+                owner_heading=last_company_label if owner else None)
+        if (section_kind == "保证合同" and "保证合同" in raw_label and
+                owner is None and not is_certificate_number and not is_certificate_type):
+            pending_guarantee_titles.append(len(rows) - 1)
         if is_certificate_number and certificate_type:
             # 类型来自“身份证号”等原标签本身，属于材料明示，不是默认身份证。
             add_row(line=n, label=raw_label, key="证件类型", value=certificate_type, quote=quote,
@@ -396,7 +427,8 @@ def absorb_with_diagnostics(path: Path) -> tuple[list[dict[str, Any]], list[dict
                     confidence=0.95 if owner else 0.6,
                     needs="收" if owner and not assumed else "默认" if owner else "指明主体",
                     assumed=assumed, known_key=True, ownership_group=ownership_group,
-                    certificate_type=certificate_type)
+                    certificate_type=certificate_type,
+                    owner_heading=last_company_label if owner else None)
     return rows, issues
 
 
@@ -509,8 +541,11 @@ def source_questions(rows: list[dict]) -> list[dict]:
             detail += "建议归属：%s。依据：%s。请确认或修改。" % (suggested, r["context"])
         else:
             detail += "材料未给出足以确认归属的上下文；请指定公司或个人，或暂不收录。"
+        heading = r.get("owner_heading")
+        owner_title = ("%s %s · " % (heading, suggested)
+                       if heading and suggested else "")
         questions.append({
-            "id": "source-%s" % r["n"], "header": "材料归属 · %s" % r["key"],
+            "id": "source-%s" % r["n"], "header": "%s材料归属 · %s" % (owner_title, r["key"]),
             "question": detail,
             "options": options,
         })

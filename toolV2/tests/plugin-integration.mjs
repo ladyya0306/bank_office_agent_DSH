@@ -16,7 +16,7 @@ try {
   const setup = spawnSync(python, ['-', work], {encoding: 'utf8', windowsHide: true, input: [
     'import sys', 'from pathlib import Path', 'from docx import Document',
     'p=Path(sys.argv[1])', '(p/"source").mkdir()', '(p/"target").mkdir()', 'd=Document()',
-    'd.add_paragraph("借款人：合成企业")', 'd.add_paragraph("收款账号：123456789")',
+    'd.add_paragraph("收款账号：123456789")', 'd.add_paragraph("借款人：合成企业")',
     'd.save(p/"source"/"source.docx")', 'd=Document()', 'd.add_paragraph("收款账号：")',
     'd.save(p/"target"/"target.docx")',
   ].join('\n'), env: {...process.env, PYTHONUTF8: '1'}});
@@ -27,7 +27,7 @@ try {
     run: (payload, options) => runOfficePython(root, python, payload, options),
     ask: async ({questions}) => {
       cards += questions.length;
-      return {answers: questions.map(q => ({id:q.id, selected:[q.options[0].label], custom:''}))};
+      return {answers: questions.map(q => ({id:q.id, selected:[q.options.find(o=>o.label.startsWith('归属：合成企业'))?.label || q.options[0].label], custom:''}))};
     },
   };
   const cancelled = await runOfficeFill(args, { ...ports, ask: async () => {
@@ -40,7 +40,7 @@ try {
   assert.equal(first.results.length, 1);
   assert.ok(cards > 0);
   assert.equal(first.timing.cancelled_waits, 1);
-  assert.equal(first.timing.stages.user_confirmation_wait.count, 3);
+  assert.equal(first.timing.stages.user_confirmation_wait.count, 2);
   assert.ok(first.timing.stages.user_confirmation_wait.seconds >= 0.02);
   const originalCards = cards;
   const second = await runOfficeFill({work, task_id: first.task_id}, ports);
@@ -51,8 +51,8 @@ try {
   const changed = spawnSync(python, ['-', work], {encoding:'utf8', windowsHide:true,
     env:{...process.env, PYTHONUTF8:'1'}, input:[
       'import sys', 'from pathlib import Path', 'from docx import Document',
-      'd=Document()', 'd.add_paragraph("借款人：合成企业")',
-      'd.add_paragraph("收款账号：987654321")', 'd.save(Path(sys.argv[1])/"source"/"source.docx")',
+      'd=Document()', 'd.add_paragraph("收款账号：987654321")',
+      'd.add_paragraph("借款人：合成企业")', 'd.save(Path(sys.argv[1])/"source"/"source.docx")',
     ].join('\n')});
   assert.equal(changed.status, 0, changed.stderr);
   const third = await runOfficeFill(args, ports);

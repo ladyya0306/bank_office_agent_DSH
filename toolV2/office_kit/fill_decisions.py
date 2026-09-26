@@ -41,6 +41,8 @@ def fingerprint(plan: dict, row: dict) -> str:
     }
     if row.get("subject_scope"):
         data["subject_scope"] = row["subject_scope"]
+    if row.get("relationship_review"):
+        data["relationship_review"] = row["relationship_review"]
     raw = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 

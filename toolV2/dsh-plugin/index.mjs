@@ -4,6 +4,9 @@ import { fileURLToPath } from 'node:url';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import '@deepseek-ai/dsh-user-questions';
 import { runOfficeFill } from './controller.mjs';
+import { renderOfficeOutput } from './render.mjs';
+
+export { renderOfficeOutput };
 
 export const name = 'office-tool-v2';
 export const inject = ['tools', 'userQuestions'];
@@ -146,30 +149,33 @@ export function apply(ctx, config = {}) {
     name: 'office_fill_task',
     description: '用户要求填表时唯一使用的办公工具。用户只需说“填表”；本工具会在必要时原生询问一次并自动继续。恢复中断任务时提供 task_id。终态直接返回文件结果。',
     parameters: {
-      work: { type: 'string', required: true, description: '本次任务工作区，必须在当前会话目录内' },
-      source: { type: 'array', items: { type: 'string' }, description: '一个或多个信息源文件路径；新建任务必填' },
-      targets: { type: 'array', items: { type: 'string' }, description: '要填写的目标模板路径；新建任务必填' },
+      work: { type: 'string', required: true, description: '本次任务工作区，必须在当前会话目录内。Windows 路径建议使用正斜杠，例如 D:/资料，避免 JSON 反斜杠转义错误。source/targets 可传相对 work 的路径。' },
+      source: { type: 'array', items: { type: 'string' }, description: '一个或多个信息源文件或目录路径；目录只展开直接子文件，不递归子目录；需要处理子目录时将子目录本身作为路径传入；新建任务必填' },
+      targets: { type: 'array', items: { type: 'string' }, description: '目标模板文件或目录路径；目录只展开直接子文件，不递归子目录；需要处理子目录时将子目录本身作为路径传入；新建任务必填' },
       batch: { type: 'string', description: '通常省略，程序优先继续相同源文件和目标文件的原任务。仅用户明确指定业务批次时填写 YYYYMMDD-NN，不得自行编造日期或用任务描述代替批次。' },
       task_id: { type: 'string', description: '恢复已有任务时提供；工具会查状态并在需要时继续询问' },
       mapping_read: { type: 'object', additionalProperties: false, properties: {
-        section: { type: 'string', enum: ['fields', 'templates', 'positions', 'current_positions', 'source_details', 'context', 'issues'] },
+        section: { type: 'string', enum: ['fields', 'source', 'document', 'output', 'templates', 'positions', 'current_positions', 'source_details', 'context', 'issues'] },
         template: { type: 'string' }, offset: { type: 'integer' }, revision: { type: 'string' },
         field: { type: 'string' }, slot_id: { type: 'string' },
-      }, description: '读取原任务的来源或位置页，必须同传task_id。续页原样传返回的next；按模板用section:positions和template。只读，不重新解析或弹窗。不能与rule_updates同传。' },
+      }, description: '读取原任务的来源、模板、当前产物或位置页，必须同传task_id。positions仅列尚未关联的空位，已关联项用current_positions；完整模板用document+template，核验当前产物用output+template，无需解压脚本。续页原样传返回的next。只读，不重新填报或弹窗。不能与rule_updates同传。' },
       rule_updates: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: {
           template: { type: 'string', required: true },
           slot_id: { type: 'string' },
           field: { type: 'string' },
+          template_reference: { type: 'object', additionalProperties: false, properties: {
+            sheet: { type: 'string', required: true }, cell: { type: 'string', required: true },
+          }, description: '采用同一本Excel模板内相同标签、相同主体的固定值，传same_label_references给出的sheet和cell；不与field同传。' },
           target: { type: 'object', additionalProperties: true, properties: {} },
           leave_blank: { type: 'boolean' },
           reason: { type: 'string' },
           label: { type: 'string' },
           expected_target: { type: 'object', additionalProperties: true, properties: {} },
-        } }, description: '仅对 needs_mapping 的 mapping_requests 提交位置映射：新格式为 template+slot_id+field，或 template+slot_id+leave_blank+reason；兼容旧格式 template+field+target；必须与 task_id 同传' },
+        } }, description: '仅对 needs_mapping 的 mapping_requests 提交位置映射：template+slot_id+field，或template+slot_id+template_reference复用同模板固定值，或template+slot_id+leave_blank+reason；兼容旧格式template+field+target；必须与task_id同传' },
     },
     output: { schema: { type: 'object', additionalProperties: true, properties: {} },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+      render: (_args, value) => [{ type: 'text', text: renderOfficeOutput(value) }] },
     async execute(args, exec) {
       if (!args.task_id && (!Array.isArray(args.source) || !Array.isArray(args.targets))) {
         throw new Error('新建填表任务需要 source 和 targets 文件列表');
