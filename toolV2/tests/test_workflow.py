@@ -77,13 +77,14 @@ class WorkflowContractTests(unittest.TestCase):
         book = load_workbook(path, data_only=True)
         return "\n".join(str(cell.value or "") for row in book.active.iter_rows() for cell in row)
 
-    def test_json_entry_creates_task_and_returns_source_question(self) -> None:
+    def test_json_entry_fills_explicit_source_without_redundant_question(self) -> None:
         result = self.start()
         self.assertTrue(result["ok"])
-        self.assertEqual("awaiting_source", result["status"])
+        self.assertEqual("completed", result["status"])
         self.assertTrue(result["task_id"])
         self.assertEqual("20260925-01", result["batch"])
-        self.assertTrue(any(q["id"].startswith("source-") for q in result["questions"]))
+        self.assertEqual([], result['questions'])
+        self.assertIn('13800000000', self.sheet_text(result['results'][0]['output']))
         self.assertTrue((self.work / "db" / "workflow.db").is_file())
 
     def test_unchanged_request_reuses_public_task_state(self) -> None:
@@ -94,15 +95,16 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(first["questions"], second["questions"])
 
     def test_changed_source_reasks_only_changed_evidence_without_consuming_old_answer(self) -> None:
+        # Ownership is actually unknown; clear borrower sections no longer ask.
+        source = Document(); source.add_paragraph('联系电话：13800000000'); source.save(self.source)
         original = self.start()
         old_question = original["questions"][0]
         answered = request({"action": "resume", "work": str(self.work), "task_id": original["task_id"],
                             "answers": [{"id": old_question["id"],
-                                         "selected": [old_question["options"][0]["label"]], "custom": ""}]})
+                                         "selected": [], "custom": "合成甲公司"}]})
         self.assertNotEqual("awaiting_source", answered["status"])
         self.source.unlink()
         changed = Document()
-        changed.add_paragraph("借款人：合成甲公司")
         changed.add_paragraph("联系电话：13900000000")
         changed.save(self.source)
         source_changed = self.start()
@@ -117,6 +119,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotEqual(self.start()["task_id"], self.start(batch="20260925-02")["task_id"])
 
     def test_empty_resume_does_not_execute_fill(self) -> None:
+        source = Document(); source.add_paragraph('联系电话：13800000000'); source.save(self.source)
         task = self.start()
         result = request({"action": "resume", "work": str(self.work),
                           "task_id": task["task_id"], "answers": []})

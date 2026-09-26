@@ -86,6 +86,29 @@ class MaterialVariantTests(unittest.TestCase):
         self.assertEqual("借款方法人", self.row(rows, "证件号码", "BORROWER-ID")["entity_name"])
         self.assertEqual("保证方法人", self.row(rows, "证件号码", "GUARANTOR-PASS")["entity_name"])
 
+    def test_numbered_guarantor_sections_do_not_overwrite_current_owner(self) -> None:
+        source = self.doc("two-guarantors.docx", "借款人：合成借款公司",
+                          "地址：借款地址", "保证人1：合成个人保证人",
+                          "联系电话：PERSON-PHONE", "保证人2：合成保证公司",
+                          "地址：保证公司地址", "法人：保证公司法人",
+                          "开户行：中国合成银行 账号：622200000001")
+        rows = absorb(source)
+        self.assertEqual("合成个人保证人", self.row(rows, "联系电话", "PERSON-PHONE")["entity_name"])
+        self.assertEqual("合成保证公司", self.row(rows, "地址", "保证公司地址")["entity_name"])
+        self.assertEqual("合成保证公司", self.row(rows, "保证人法定代表人", "保证公司法人")["entity_name"])
+        self.assertEqual("合成保证公司", self.row(rows, "开户行", "中国合成银行")["entity_name"])
+        self.assertEqual("合成保证公司", self.row(rows, "收款账号", "622200000001")["entity_name"])
+
+    def test_guarantee_amount_and_term_on_one_line_are_separate_facts(self) -> None:
+        source = self.doc("guarantee-amount-term.docx", "最高额保证合同：CONTRACT-2",
+                          "保证人2：合成保证公司",
+                          "保证金额：800万元  期限：2026-09-17至2027-09-17")
+        rows = absorb(source)
+        amount = self.row(rows, "保证金额", "800万元")
+        term = self.row(rows, "保证期限", "2026-09-17至2027-09-17")
+        self.assertEqual("合成保证公司", amount["entity_name"])
+        self.assertEqual("合成保证公司", term["entity_name"])
+
     def test_company_and_natural_person_document_values_do_not_cross_owners(self) -> None:
         source = self.doc("company-person.docx", "借款人：合成借款公司",
                           "统一社会信用代码：COMPANY-CREDIT", "保证人：合成个人保证人",
@@ -113,8 +136,9 @@ class MaterialVariantTests(unittest.TestCase):
         rows = absorb(source)
         combined = self.row(rows, "开户行及账号", "中国合成银行 622200000001")
         self.assertEqual("合成借款公司", combined["entity_name"])
-        self.assertTrue(combined["assumed"])
-        self.assertIn("开户行及账号：中国合成银行 622200000001", source_questions(rows)[0]["question"])
+        # 紧随材料明确的借款人，归属已经由源文直接证明，不再重复提问。
+        self.assertFalse(combined["assumed"])
+        self.assertEqual([], source_questions(rows))
 
     def test_one_line_bank_and_account_labels_are_split_or_explicitly_reported(self) -> None:
         source = self.doc("one-line-bank-account.docx", "借款人：合成借款公司",
@@ -133,17 +157,19 @@ class MaterialVariantTests(unittest.TestCase):
         target = self.doc("target.docx", "联系电话：")
         started = self.start([first, second], target)
         self.assertEqual("awaiting_source", started["status"], started)
-        answered = request({"action": "resume", "work": str(self.work), "task_id": started["task_id"],
-                            "answers": [{"id": question["id"],
-                                         "selected": [question["options"][0]["label"]], "custom": ""}
-                                        for question in started["questions"]]})
-        self.assertEqual("awaiting_source", answered["status"], answered)
-        conflict = next(question for question in answered["questions"]
+        conflict = next(question for question in started["questions"]
                         if question["id"].startswith("source-conflict-"))
         self.assertIn("source-a.docx", conflict["question"])
         self.assertIn("source-b.docx", conflict["question"])
         self.assertIn("13800000000", conflict["question"])
         self.assertIn("13900000000", conflict["question"])
+        # 第 0 项是“暂不采用”；明确选第一份来源，不能依赖其默认位置。
+        answered = request({"action": "resume", "work": str(self.work), "task_id": started["task_id"],
+                            "answers": [{"id": conflict["id"],
+                                         "selected": [conflict["options"][1]["label"]], "custom": ""}]})
+        self.assertEqual("completed", answered["status"], answered)
+        output = Document(answered["results"][0]["output"])
+        self.assertIn("联系电话：13800000000", [p.text for p in output.paragraphs])
 
     def test_guarantee_contract_boundary_does_not_inherit_borrower(self) -> None:
         source = self.doc("contract-boundary.docx", "借款人：合成借款公司",
@@ -174,8 +200,9 @@ class MaterialVariantTests(unittest.TestCase):
         unknown = self.row(rows, "风险提示", "仅供合成测试")
         self.assertFalse(unknown["known_key"])
         self.assertEqual("合成借款公司", unknown["entity_name"])
-        question = next(q for q in source_questions(rows) if "风险提示" in q["question"])
-        self.assertIn("风险提示：仅供合成测试", question["question"])
+        # 未识别标签仍保留，但明确借款人段内的归属无需人工重复确认。
+        self.assertFalse(unknown["assumed"])
+        self.assertFalse(any("风险提示" in q["question"] for q in source_questions(rows)))
 
     def test_mixed_business_fact_is_not_completed_without_mapping_or_unparsed_notice(self) -> None:
         source = self.doc("mixed-business-fact.docx", "借款人：合成借款公司",

@@ -18,7 +18,7 @@ from .store_v2 import StoreV2, now_utc, write_event
 
 def needs_answer(row: dict) -> bool:
     return row.get("kind") == "slot" and (
-        row.get("decision") in ("ask", "auto") or
+        row.get("decision") == "ask" or
         (row.get("decision") == "empty" and bool(row.get("is_required")))
     )
 
@@ -62,12 +62,15 @@ def saved_choices(plan: dict) -> tuple[dict, list[int]]:
     selected: list[str] = []
     missing: list[int] = []
     with _store(plan) as store:
-        for row in _rows(plan):
+        for row in plan.get('rows', []):
+            if not needs_answer(row) and not (row.get('kind') == 'slot' and row.get('decision') == 'auto'):
+                continue
             hit = store.conn.execute(
                 "SELECT action,value FROM fill_decision WHERE fingerprint=?",
                 (fingerprint(plan, row),)).fetchone()
             if hit is None:
-                missing.append(int(row["n"]))
+                if needs_answer(row):
+                    missing.append(int(row["n"]))
                 continue
             n = str(row["n"])
             action, value = hit["action"], hit["value"]
@@ -83,6 +86,38 @@ def saved_choices(plan: dict) -> tuple[dict, list[int]]:
                 missing.append(int(n))
     choices["select"] = ",".join(selected)
     return choices, missing
+
+
+def reuse_unchanged_choices(previous: dict, plan: dict) -> int:
+    """Keep real prior answers when only the automatic review policy changes."""
+    if previous.get('batch_no') != plan.get('batch_no'):
+        return 0
+    def evidence_key(row):
+        return fingerprint(plan, {**row, 'decision': None, 'ask_reason': None})
+    old = {evidence_key(row): row for row in previous.get('rows', [])
+           if row.get('kind') == 'slot' and row.get('template_sha256')}
+    count = 0
+    with _store(plan) as store:
+        for row in plan.get('rows', []):
+            if row.get('kind') != 'slot' or not row.get('template_sha256'):
+                continue
+            prior = old.get(evidence_key(row))
+            if prior is None:
+                continue
+            before, after = fingerprint(previous, prior), fingerprint(plan, row)
+            if before == after:
+                continue
+            # Copy an existing answer only; automatic filling never creates a
+            # fictitious user acceptance. Evidence/ownership/target changes do
+            # not match and therefore cannot inherit a stale decision.
+            result = store.conn.execute(
+                'INSERT OR IGNORE INTO fill_decision '
+                '(fingerprint,batch_no,template_sha256,field,action,value,decided_at,run_id) '
+                'SELECT ?,batch_no,template_sha256,field,action,value,decided_at,run_id '
+                'FROM fill_decision WHERE fingerprint=?', (after, before))
+            count += result.rowcount
+        store.conn.commit()
+    return count
 
 
 def save_choices(plan: dict, choices: dict) -> int:

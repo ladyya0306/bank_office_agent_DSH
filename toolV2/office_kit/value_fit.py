@@ -1,10 +1,11 @@
 """Fit a source value into a template's already printed wrapper or unit.
 
-Only remove literal text the template itself already supplies.  Never convert
-units or invent missing parts of a contract number.
+Only adapt values to literal text the template already supplies.  Same-currency
+renminbi units are converted exactly; no cross-currency conversion is attempted.
 """
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation, localcontext
 import re
 
 from .common import OfficeKitError
@@ -12,6 +13,17 @@ from .common import OfficeKitError
 
 _PRINTED_ENDINGS = ("有限公司", "万元", "人民币", "公司", "元", "年", "号")
 _YUAN_AMOUNT = re.compile(r"(?:人民币\s*)?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?\s*(?:万|亿)?")
+_AMOUNT_VALUE = re.compile(
+    r"^\s*(?:人民币\s*)?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?\s*(?P<unit>亿元|万元|元|亿|万)?\s*$"
+)
+_AMOUNT_UNITS = ("万元", "亿元", "元", "万", "亿")
+_AMOUNT_FACTORS = {"元": Decimal(1), "万": Decimal(10_000), "万元": Decimal(10_000),
+                   "亿": Decimal(100_000_000), "亿元": Decimal(100_000_000)}
+_VALUE_UNITS = ("万元", "亿元", "元", "年", "个月", "月", "日", "人", "户", "份", "笔", "个", "次", "家", "%")
+_UNIT_BLANK_RE = re.compile(
+    r"(?:[ \u3000]+|_{2,}|＿{2,}|[□☐]+)(?=(?:万元|亿元|元|年|个月|月|日|人|户|份|笔|个|次|家|%))"
+)
+_PLACEHOLDER_MARK_RE = re.compile(r"[ \u3000]+|_{2,}|＿{2,}|[□☐]+")
 _DATE_PART = r"\d{4}(?:\s*年(?:\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日?)?)?|[-./]\d{1,2}(?:[-./]\d{1,2})?)?"
 _DATE_RANGE = re.compile(_DATE_PART + r"\s*起?\s*(?:至|到|[-—–~～]+)\s*" + _DATE_PART)
 
@@ -27,7 +39,56 @@ def value_fit_issue(text: str, start: int, end: int, source_value: str) -> str |
     if right.startswith(("年", "个月", "月")) and _DATE_RANGE.search(value):
         unit = "年" if right.startswith("年") else ("个月" if right.startswith("个月") else "月")
         return "模板此处固定印有“%s”，需要期限数量；来源值是日期区间，不能直接填写" % unit
+    amount_unit = next((unit for unit in _AMOUNT_UNITS if right.startswith(unit)), None)
+    if amount_unit and not _AMOUNT_VALUE.fullmatch(value):
+        return "模板此处固定印有人民币金额单位“%s”，来源值不是可识别的人民币数字金额；不能进行跨币种换算" % amount_unit
     return None
+
+
+def unit_wrapper_span(text: str) -> tuple[int, int] | None:
+    """Find one blank amount/unit slot in a compact Excel value cell.
+
+    This is intentionally stricter than general blank discovery: a neighbouring
+    label is needed by callers, and the blank must sit directly before a known
+    printed unit. Multiple blanks are ambiguous and are left for review.
+    """
+    if not isinstance(text, str):
+        return None
+    candidates = []
+    for match in _UNIT_BLANK_RE.finditer(text):
+        right = text[match.end():].lstrip()
+        if any(right.startswith(unit) for unit in _VALUE_UNITS):
+            candidates.append(match.span())
+    if len(candidates) != 1 or len(list(_PLACEHOLDER_MARK_RE.finditer(text))) != 1:
+        return None
+    return candidates[0]
+
+
+def _amount_unit(value: str) -> str | None:
+    match = _AMOUNT_VALUE.fullmatch(value)
+    return match.group('unit') if match else None
+
+
+def _converted_amount(value: str, target_unit: str) -> str:
+    """Return a source amount in the template's printed unit, without float math."""
+    match = _AMOUNT_VALUE.fullmatch(value.strip())
+    if not match:
+        raise OfficeKitError(
+            f"模板此处固定印有人民币金额单位“{target_unit}”，来源值不是可识别的人民币数字金额；不能进行跨币种换算")
+    source_unit = match.group("unit")
+    number = re.sub(r"[ ,，\s]", "", value.strip())
+    number = re.sub(r"^人民币", "", number).strip()
+    number = re.sub(r"(?:亿元|万元|元|亿|万)$", "", number).strip()
+    try:
+        with localcontext() as context:
+            context.prec = max(50, len(number) + 20)
+            amount = Decimal(number)
+            if source_unit:
+                amount = amount * _AMOUNT_FACTORS[source_unit] / _AMOUNT_FACTORS[target_unit]
+    except InvalidOperation as exc:
+        raise OfficeKitError("来源金额无法精确解析，不能按模板单位换算") from exc
+    rendered = format(amount.normalize(), "f")
+    return "0" if rendered in ("-0", "") else rendered
 
 
 def fit_value(text: str, start: int, end: int, source_value: str) -> str:
@@ -37,6 +98,12 @@ def fit_value(text: str, start: int, end: int, source_value: str) -> str:
     value = str(source_value)
     left = text[:start].rstrip()
     right = text[end:].lstrip()
+
+    printed_amount_unit = next((unit for unit in _AMOUNT_UNITS if right.startswith(unit)), None)
+    if printed_amount_unit:
+        value = _converted_amount(value, printed_amount_unit)
+    if left.endswith("人民币") and value.strip().startswith("人民币"):
+        value = value.strip()[len("人民币"):].lstrip()
 
     # A printed 元 can complete 800万 + 元. It cannot turn 800美元 into a
     # renminbi amount. Require a plain numeric amount before this suffix;

@@ -1,12 +1,13 @@
 """Expose concrete template gaps so the model maps facts, not hand-written code."""
+import re
 from office_kit import doc_fill
 from office_kit.common import OfficeKitError
 from office_kit.store_v2 import sha256_file
 from office_kit.harness import candidates_for
 from office_kit.template_slots import discover_slots
-from office_kit.target_validation import validate_target
+from office_kit.target_validation import validate_target, read_word_template, read_excel_template
 
-SLOT_DISCOVERY_VERSION = 2
+SLOT_DISCOVERY_VERSION = 5
 
 
 def contains(outer, inner):
@@ -28,7 +29,7 @@ def physical(path, target, engine=None):
         return set().union(*(physical(path, t, engine) for t in target['targets']))
     if path.suffix.lower() == '.xlsx':
         import openpyxl
-        wb = openpyxl.load_workbook(path)
+        wb = read_excel_template(path)
         try:
             sheet = target.get('sheet', 0)
             ws = wb.worksheets[sheet] if isinstance(sheet, int) else wb[sheet]
@@ -41,7 +42,7 @@ def physical(path, target, engine=None):
             return {(ws.title, target['cell'], start, end)}
         finally:
             wb.close()
-    engine = engine or doc_fill.XmlEngine(path)
+    engine = engine or read_word_template(path)
     if target.get('kind') == 'cell':
         cell = engine.document.tables[int(target['table'])].cell(int(target['row']), int(target['col']))
         raw = engine.xml_for(cell.paragraphs[0])
@@ -60,7 +61,7 @@ def inspect(store, path, record, facts):
         record['slots'] = discover_slots(path)
         record['slot_hash'] = sha256_file(path)
         record['slot_version'] = SLOT_DISCOVERY_VERSION
-    engine = doc_fill.XmlEngine(path) if path.suffix.lower() == '.docx' else None
+    engine = read_word_template(path) if path.suffix.lower() == '.docx' else None
     covered = set()
     for rule in store.rules_for(path):
         try:
@@ -76,7 +77,7 @@ def inspect(store, path, record, facts):
         positions = physical(path, slot['target'], engine)
         if positions and all(any(contains(c, p) for c in covered) for p in positions):
             continue
-        missing.append({**slot, 'candidates': candidates_for(slot.get('label', ''), facts)})
+        missing.append({**slot, 'candidates': scoped_candidates(store, path, slot, facts)[:4]})
     record['unmapped_slots'] = missing
     record['coverage'] = {'detected': len(record['slots']), 'unmapped': len(missing),
                           'protected': sum(bool(s.get('protected')) for s in record['slots']),
@@ -108,22 +109,179 @@ def visible_slot(slot):
             'full_context': {'section': 'context', 'slot_id': slot['id']}}
 
 
+def semantic_compatible(field, slot):
+    """Reject an obviously different *position meaning*, not just a low score.
+
+    Labels on old shared/multi rules can describe another blank.  A source
+    ``授信期限`` is not a board-meeting date, and a contract number is not a
+    product/count field.  These are generic document semantics, evaluated
+    from the visible position text rather than template names or coordinates.
+    """
+    target = slot.get('target', {})
+    text = ' '.join(str(value) for value in (
+        target.get('expected_text', ''), *(slot.get('context', {}) or {}).values()) if value)
+    if re.search(r'会议(?:时间|日期)', text) and re.search(r'期限', field):
+        return False
+    if re.search(r'(?:品种|份数)', text) and re.search(r'合同|协议|编号', field):
+        return False
+    return True
+
+
+def scoped_candidates(store, path, slot, facts):
+    """Rank source identities inside this position's actual subject context."""
+    from office_kit.fact_catalog import target_subject_context
+    from office_kit.harness import score_candidate
+    scope = target_subject_context(store, path, slot['target'], label=slot.get('label', ''),
+                                   context=slot.get('context'))
+    identities = {}
+    target = slot['target']
+    raw = str(target.get('expected_text') or '')
+    after = raw[int(target.get('span_end', 0)):]
+    contract = re.match(r'[】\]）)\s]*的?[《【]\s*[【]?([^》】]+)[】]?[》】]', after)
+    contract_title = contract.group(1).strip() if contract and '合同' in contract.group(1) else None
+    for field, meta in facts.items():
+        if not semantic_compatible(field, slot):
+            continue
+        owner = meta.get('_relation_owner_eid') or meta.get('entity_id')
+        if scope['entity_ids'] and owner not in scope['entity_ids'] and owner is not None:
+            continue
+        if meta.get('_ambiguous'):
+            continue
+        score = score_candidate(slot.get('label', ''), field)
+        if contract_title and re.sub(r'^(借款人|保证人|担保人)\d*', '', field) == contract_title:
+            score = 1.0
+        if meta.get('_base_field'):
+            score = max(score, score_candidate(slot.get('label', ''), meta['_base_field']))
+        if not scope['entity_ids']:
+            # Generic “法定代表人” cannot favor the borrower's alias simply
+            # because the old synonym table gives that role a higher score.
+            neutral = re.sub(r'^(借款人|保证人|担保人)\d*', '', field)
+            score = max(score, score_candidate(slot.get('label', ''), neutral))
+        identity = (meta.get('fact_id', meta.get('id')), owner, meta.get('_base_field') or field)
+        # Qualified aliases of a known fact must not create artificial ties.
+        if identity[0] is not None:
+            identity = identity[:2]
+        old = identities.get(identity)
+        if old is None or (score, bool(meta.get('_qualified'))) > (old['score'], old['qualified']):
+            identities[identity] = {'field': field, 'score': score,
+                                    'qualified': bool(meta.get('_qualified'))}
+    return sorted(identities.values(), key=lambda x: -x['score'])
+
+
+def _retire_semantic_mismatch(store, path, record, batch):
+    """Retire only legacy rule targets whose current visible slot disagrees."""
+    engine = read_word_template(path) if path.suffix.lower() == '.docx' else None
+    slots = record.get('slots', [])
+    for rule in list(store.rules_for(path)):
+        children = rule['target'].get('targets', [rule['target']])
+        kept, removed = [], False
+        for target in children:
+            try:
+                position = physical(path, target, engine)
+                matches = [slot for slot in slots
+                           if intersects(position, physical(path, slot['target'], engine))]
+            except (OfficeKitError, KeyError, IndexError, ValueError, TypeError):
+                matches = []
+            if matches and any(not semantic_compatible(rule['field'], slot) for slot in matches):
+                removed = True
+            else:
+                kept.append(target)
+        if not removed:
+            continue
+        store.disable_rule(path, rule['field'], rule['target'],
+                           '当前位置语义与来源字段不兼容，停用旧映射并保留历史')
+        if kept:
+            replacement = kept[0] if len(kept) == 1 else {'kind': 'multi', 'targets': kept}
+            store.add_rule(rule['template_id'], rule['field'], rule['label'], replacement,
+                           confidence=rule['confidence'], decided_by=rule['decided_by'], batch_no=batch)
+
+
+def _best(candidates):
+    if not candidates or candidates[0]['score'] < .85:
+        return None
+    if len(candidates) > 1 and candidates[1]['score'] == candidates[0]['score']:
+        return None
+    return candidates[0]
+
+
+def _refresh_value_cells(store, path, record, facts, batch):
+    """Replace old label/value duplicate mappings using the visible left label."""
+    if path.suffix.lower() != '.xlsx' or record.get('value_cell_version') == SLOT_DISCOVERY_VERSION:
+        return
+    for slot in record.get('slots', []):
+        target = slot['target']
+        if not target.get('label_cell') or not slot.get('replaces_targets') or slot.get('protected'):
+            continue
+        picked = _best(scoped_candidates(store, path, slot, facts))
+        for rule in list(store.rules_for(path)):
+            children = rule['target'].get('targets', [rule['target']])
+            kept = [c for c in children if not (
+                c.get('sheet') == target.get('sheet') and
+                c.get('cell') in (target['cell'], target['label_cell']))]
+            if len(kept) == len(children):
+                continue
+            store.disable_rule(path, rule['field'], rule['target'],
+                               '重新按左侧标签与右侧值格关联，原位置保留历史')
+            if kept:
+                store.add_rule(rule['template_id'], rule['field'], rule['label'],
+                               kept[0] if len(kept) == 1 else {'kind':'multi','targets':kept},
+                               confidence=rule['confidence'], decided_by=rule['decided_by'], batch_no=batch)
+        if picked:
+            item = {'field':picked['field'], 'slot_id':slot['id'],
+                    'target':{**target,'slot_id':slot['id']}}
+            replacement = combine(store,path,item)
+            store.add_rule(store.register_template(path,batch),picked['field'],slot['label'],replacement,
+                           confidence=picked['score'],decided_by='auto',batch_no=batch)
+    record['value_cell_version'] = SLOT_DISCOVERY_VERSION
+
+
+def _retire_obsolete_slots(store, path, record, batch):
+    """Retire old detected blanks that the current parser identifies as layout."""
+    if record.get('slot_migration_version') == SLOT_DISCOVERY_VERSION:
+        return
+    current = {s['id'] for s in record.get('slots', [])}
+    engine = read_word_template(path) if path.suffix.lower() == '.docx' else None
+    positions = [physical(path, s['target'], engine) for s in record.get('slots', [])]
+    for rule in list(store.rules_for(path)):
+        children = rule['target'].get('targets', [rule['target']])
+        kept = []
+        for target in children:
+            if not target.get('slot_id') or target['slot_id'] in current:
+                kept.append(target)
+                continue
+            try:
+                previous = physical(path, target, engine)
+                if any(intersects(previous, p) for p in positions):
+                    kept.append(target)
+            except (OfficeKitError, KeyError, ValueError, IndexError, TypeError):
+                pass
+        if len(kept) != len(children):
+            store.disable_rule(path, rule['field'], rule['target'],
+                               '旧检测空位已不再是可填写位置；保留原位置历史')
+            if kept:
+                store.add_rule(rule['template_id'], rule['field'], rule['label'],
+                               kept[0] if len(kept) == 1 else {'kind':'multi','targets':kept},
+                               confidence=rule['confidence'],decided_by=rule['decided_by'],batch_no=batch)
+    record['slot_migration_version'] = SLOT_DISCOVERY_VERSION
+
+
 def auto_map(store, path, record, facts, batch):
-    """Automatically map only unambiguous labels; leave sentence meanings to model."""
+    """Map unique source facts in the position's role; expose actual ambiguities."""
+    inspect(store, path, record, facts)
+    _retire_semantic_mismatch(store, path, record, batch)
+    _retire_obsolete_slots(store, path, record, batch)
+    _refresh_value_cells(store, path, record, facts, batch)
     missing = inspect(store, path, record, facts)
-    role_count = len({r['entity_id'] for r in store.roles() if r['role'] in ('借款人', '保证人')})
     added = 0
     for slot in missing:
-        candidates = slot['candidates']
-        if not candidates or candidates[0]['score'] < .85:
+        candidates = scoped_candidates(store, path, slot, facts)
+        slot['candidates'] = candidates[:4]
+        chosen = _best(candidates)
+        if chosen is None:
             continue
-        if len(candidates) > 1 and candidates[1]['score'] == candidates[0]['score']:
-            continue
-        field = candidates[0]['field']
-        if role_count > 1 and any(field.startswith(role) and role not in slot.get('label', '')
-                                  and role not in path.stem for role in ('借款人', '保证人')):
-            continue
+        field = chosen['field']
         item = {'field': field, 'slot_id': slot['id'], 'target': {**slot['target'], 'slot_id': slot['id']}}
+        retire_overlap(store, path, item['target'], field, batch)
         target = combine(store, path, item)
         validate_target(path, target)
         tid = store.register_template(path, batch)
@@ -188,7 +346,7 @@ def combine(store, path, item):
         return target
     if not old:
         return target
-    engine = doc_fill.XmlEngine(path) if path.suffix.lower() == '.docx' else None
+    engine = read_word_template(path) if path.suffix.lower() == '.docx' else None
     current = physical(path, target, engine)
     retained = []
     for child in old['target'].get('targets', [old['target']]):
@@ -206,7 +364,7 @@ def combine(store, path, item):
 
 def retire_overlap(store, path, target, keep_field, batch):
     """Replace this exact location's prior mapping, never delete rules by IDs."""
-    engine = doc_fill.XmlEngine(path) if path.suffix.lower() == '.docx' else None
+    engine = read_word_template(path) if path.suffix.lower() == '.docx' else None
     wanted = physical(path, target, engine)
     for rule in list(store.rules_for(path)):
         if rule['field'] == keep_field:

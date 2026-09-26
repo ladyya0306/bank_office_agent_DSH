@@ -68,7 +68,9 @@ class PagingTests(unittest.TestCase):
             self.assertEqual(before, r['counters'])
             self.assertTrue(any(f['value'] == '13800000000' for f in r['mapping_page']['items']))
             changed = request({'action': 'update_positions', 'work': str(moved), 'task_id': result['task_id'], 'updates': updates})
-            self.assertEqual('awaiting_fill', changed['status'], changed)
+            self.assertEqual('completed', changed['status'], changed)
+            self.assertEqual([], changed['questions'])
+            self.assertEqual(15, len(changed['results']))
             stale = request({'action': 'read_mapping', 'work': str(moved), 'task_id': result['task_id'],
                              'mapping_read': {'section': 'positions', 'template': targets[0], 'revision': r['mapping_page']['revision']}})
             self.assertFalse(stale['ok'])

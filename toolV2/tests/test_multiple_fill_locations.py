@@ -42,7 +42,9 @@ class MultipleLocationTests(unittest.TestCase):
                                  answers=[dict(id=q['id'], selected=[q['options'][0]['label']], custom='')
                                           for q in r['questions']]))
             self.assertEqual('completed', r['status'], r)
-            self.assertEqual(1, fill_questions)
+            # One unique, directly sourced value fills all positions without
+            # creating an extra confirmation after source ownership is known.
+            self.assertEqual(0, fill_questions)
             for row in r['results']:
                 if row['template'].endswith('.docx'):
                     doc = Document(row['output'])

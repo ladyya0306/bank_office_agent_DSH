@@ -10,12 +10,13 @@ from office_kit.store_v2 import StoreV2, allocate_batch, sha256_file, valid_batc
 from office_kit.workroot import init_workroot, is_workroot
 from office_kit.cli import build_parser, _dispatch
 from office_kit.harness import build_fill_plan, current_docx_target_errors, current_xlsx_gaps
+from office_kit.target_validation import template_read_cache
 from . import storage as state, source, review, mapping, mapping_view, timing
 
 ROOT = Path(__file__).resolve().parents[1]
 WorkflowError = ValueError
-POSITION_PARSE_VERSION = 5
-SUBJECT_PLAN_VERSION = 4
+POSITION_PARSE_VERSION = 6
+SUBJECT_PLAN_VERSION = 8
 
 
 def command(argv):
@@ -146,11 +147,23 @@ def prepare_documents(store, work, task):
         try:
             store.batch_scope = task['batch']
             store.register_template(path, task['batch'])
-            if (record.get('blank_source_signature') != task.get('source_signature')
+            if prior.get('subject_plan_version') != SUBJECT_PLAN_VERSION:
+                # Reconsider only old machine exclusions caused by the removed
+                # document-wide ownership gate. Missing-data/user blanks remain.
+                record['blank_slots'] = {k: v for k, v in record.get('blank_slots', {}).items()
+                                         if '跨主体红线' not in str(v)
+                                         and '不属于本产物' not in str(v)}
+            record['subject_plan_version'] = SUBJECT_PLAN_VERSION
+            same_source_content = (
+                record.get('blank_source_content_signature') == task.get('source_content_signature')
+                if record.get('blank_source_content_signature') else
+                record.get('blank_source_signature') in task.get('equivalent_source_signatures', []))
+            if (not same_source_content
                     or record.get('blank_template_hash') != sha256_file(path)):
                 record['blank_slots'] = {}
-                record['blank_source_signature'] = task.get('source_signature')
-                record['blank_template_hash'] = sha256_file(path)
+            record['blank_source_signature'] = task.get('source_signature')
+            record['blank_source_content_signature'] = task.get('source_content_signature')
+            record['blank_template_hash'] = sha256_file(path)
             if (prior.get('proposed_version') != POSITION_PARSE_VERSION
                     or prior.get('proposed_hash') != sha256_file(path)):
                 command(['db-propose', str(path), '--work', str(work), '--batch', task['batch']])
@@ -168,6 +181,9 @@ def prepare_documents(store, work, task):
                                        run_id=prior.get('plan', {}).get('run_id') or f"{task['batch']}-V2-{uuid.uuid4().hex[:12]}")
                 task['counts']['previews'] += 1
             plan.update(db_path=str(work / 'db/workflow.db'), template_files=[str(path)])
+            if prior.get('plan') and prior.get('inputs') != inputs:
+                from office_kit.fill_decisions import reuse_unchanged_choices
+                reuse_unchanged_choices(prior['plan'], plan)
             plan['position_inventory'] = {'template_hash': sha256_file(path),
                                           'blank_targets': [s['target'] for s in record.get('slots', [])
                                                             if s['id'] in record.get('blank_slots', {})]}
@@ -359,7 +375,7 @@ def dispatch(data):
         if data.get('action') != 'start':
             raise ValueError('工作区尚未初始化，请先开始任务')
         init_workroot(work)
-    with state.work_lock(work), StoreV2(work / 'db/workflow.db', actor='workflow') as store:
+    with state.work_lock(work), template_read_cache(), StoreV2(work / 'db/workflow.db', actor='workflow') as store:
         state.initialise(store.conn)
         action = data.get('action')
         task = None

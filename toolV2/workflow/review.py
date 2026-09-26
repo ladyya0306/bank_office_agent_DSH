@@ -131,7 +131,10 @@ def questions(task):
         else:
             suggestion = f"未找到{row.get('subject_label') or '本表对应主体'}的这项信息，可留空"
         risk = '【重要信息】' if row.get('high_risk') else ''
-        output.append({'id': qid, 'header': risk + row['field'],
+        subject = row.get('target_subject') or {}
+        role = (subject.get('role') or '') + (str(subject['number']) if subject.get('number') is not None else '')
+        heading = row['field'] if not role or row['field'].startswith(role) else role + '：' + row['field']
+        output.append({'id': qid, 'header': risk + heading,
                        'question': suggestion,
                        'detail': '<!--dsh-fill-locations:v1-->\n填写位置（%d 处）：\n\n%s\n\n自定义回答请填写要放入这些位置的文字。' %
                                  (len(places), '\n'.join(f'- {place}' for place in places)),

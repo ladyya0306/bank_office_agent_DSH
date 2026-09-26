@@ -634,6 +634,18 @@ class XlsxEngine:
         # replacement cannot shift the next span's coordinates.
         self._precise: dict[tuple[str, str], dict[str, Any]] = {}
 
+    @staticmethod
+    def _adjacent_unit_value_cell(ws, cell):
+        """Return the adjacent unit-wrapper value cell for a trailing-colon label."""
+        current = cell.value
+        if not isinstance(current, str) or not current.rstrip().endswith(("：", ":")):
+            return None
+        merged = next((r for r in ws.merged_cells.ranges if cell.coordinate in r), None)
+        next_col = merged.max_col + 1 if merged else cell.column + 1
+        candidate = ws.cell(cell.row, next_col)
+        from .value_fit import unit_wrapper_span
+        return candidate if unit_wrapper_span(candidate.value) else None
+
     def fill_xlsx_cell(self, spec: dict[str, Any], value: str) -> bool:
         coord = str(spec["cell"])
         sheet = spec.get("sheet")
@@ -661,6 +673,12 @@ class XlsxEngine:
         current = cell.value
         if cell.data_type == "f" or (isinstance(current, str) and current.startswith("=")):
             raise OfficeKitError(f"{ws.title}!{requested_coord} 是公式单元格，禁止填充")
+        adjacent_value = self._adjacent_unit_value_cell(ws, cell)
+        if adjacent_value is not None:
+            raise OfficeKitError(
+                f"{ws.title}!{requested_coord} 是标签格，右侧 {adjacent_value.coordinate} 已有单位和空位；"
+                "为避免重复写金额，请把字段映射到右侧值格"
+            )
         if "span_start" in spec or "span_end" in spec:
             if not all(k in spec for k in ("expected_text", "span_start", "span_end")):
                 raise OfficeKitError("xlsx 精确位置必须提供 expected_text、span_start、span_end")

@@ -99,8 +99,8 @@ class SourceDuplicateTests(unittest.TestCase):
                                    "task_id": first["task_id"],
                                    "answers": [{"id": source_question["id"],
                                                 "selected": [], "custom": "合成甲"}]})
-        self.assertEqual("awaiting_fill", answered_source["status"], answered_source)
-        self.assertEqual(1, len(answered_source["questions"]))
+        self.assertEqual("completed", answered_source["status"], answered_source)
+        self.assertEqual([], answered_source["questions"])
 
         completed = answer_all(answered_source, self.work)
         self.assertEqual("completed", completed["status"], completed)
@@ -122,15 +122,11 @@ class SourceDuplicateTests(unittest.TestCase):
         write_docx(self.target, "联系电话：")
 
         started = request(self.payload())
-        self.assertEqual("awaiting_source", started["status"], started)
-        self.assertEqual(2, len(started["questions"]), started["questions"])
-        started = request({"action": "resume", "work": str(self.work),
-                           "task_id": started["task_id"],
-                           "answers": [{"id": question["id"],
-                                        "selected": [question["options"][0]["label"]],
-                                        "custom": ""}
-                                       for question in started["questions"]]})
-        self.assertIn(started["status"], ("awaiting_fill", "completed"), started)
+        # Source sections are explicit, but the anonymous destination still
+        # has two owners even though their phone values happen to be equal.
+        self.assertEqual("awaiting_fill", started["status"], started)
+        self.assertEqual(1, len(started["questions"]))
+        self.assertEqual(3, len(started['questions'][0]['options']))
         conn = sqlite3.connect(self.work / "db" / "workflow.db")
         try:
             facts = conn.execute(

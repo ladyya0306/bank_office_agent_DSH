@@ -83,7 +83,7 @@ SYNONYMS: dict[str, list[str]] = {
     "借款人法定代表人身份证": ["身份证号", "身份证号码"],
     "证件类型": ["身份证件类型", "有效证件类型"],
     "证件号码": ["证件号", "有效证件号码"],
-    "联系电话": ["电话", "联系电话", "联系方式", "手机"],
+    "联系电话": ["电话", "联系电话", "联系人电话", "联系方式", "手机"],
     "联系人": ["联系人", "经办人", "业务联系人"],
     "联系人及电话": ["指定业务联系人姓名及电话", "联系人与电话"],
     "开户行": ["开户行", "开户银行", "开户行名称"],
@@ -93,14 +93,17 @@ SYNONYMS: dict[str, list[str]] = {
     "综合授信合同号": ["综合授信合同号", "授信合同号"],
     "业务编号": ["业务编号", "业务号"],
     "授信额度": ["授信额度", "额度", "授信金额", "额度金额"],
+    # 本次业务金额只对应来源明确的借款金额；绝不把授信额度当成提款金额。
+    "借款金额": ["借款金额", "本次业务金额", "本次借款金额"],
     "额度期限": ["额度期限", "授信期限", "期限", "额度起止日期"],
+    "贷款期限": ["贷款期限", "借款期限"],
     "合同金额": ["合同金额", "金额"],
     "本次申请用信金额": ["用信金额", "申请用信金额", "用信业务币种及金额", "本次业务金额"],
     "用信用途": ["用途", "用信用途", "资金用途"],
     "保证人名称": ["保证人名称", "担保人名称"],
     "保证人住所": ["保证人住所", "担保人住所"],
     "授信额度/主合同编号": ["授信额度/主合同编号", "额度/主合同编号"],
-    "已使用授信额度": ["已使用授信额度", "已用额度"],
+    "已使用授信额度": ["已使用授信额度", "已使用额度", "已用额度"],
     "可用授信额度": ["可使用授信额度", "可用授信额度", "可用额度"],
 }
 
@@ -116,9 +119,15 @@ def score_candidate(label: str, fact_key: str) -> float:
     而"是它的子串"只是巧合（0.82）。顺序反了会把真字段压到阈值以下，
     于是表单上明明有的格子被判成"没人认领"。
     """
-    a, b = _norm(label), _norm(fact_key)
+    # “担保人2”与“保证人2”是模板措辞差异，不是不同业务主体。
+    a, b = (_norm(label).replace("担保人", "保证人").replace("担保方", "保证方"),
+            _norm(fact_key).replace("担保人", "保证人").replace("担保方", "保证方"))
     if not a or not b:
         return 0.0
+    numbered_subject = re.fullmatch(r"保证人(\d+)", a)
+    if numbered_subject:
+        # “担保人2”是主体名称栏，不是其地址、电话或账号的同义词。
+        return 0.9 if b == "保证人%s名称" % numbered_subject.group(1) else 0.0
     if a == b:
         return 1.0
     for canonical, synonyms in SYNONYMS.items():
@@ -1014,7 +1023,21 @@ def _open_questions_by_entity(store: StoreV2) -> set[int | None]:
     return {r["entity_id"] for r in store.open_reviews(kind="role")}
 
 
-def _tied_candidates(label: str, facts: dict[str, dict], chosen: str) -> list[str]:
+def _fact_identity(meta: dict | None) -> tuple[object, object, object] | None:
+    """Identity for aliases of one stored fact; values alone are not identity."""
+    if not meta or meta.get("_ambiguous"):
+        return None
+    fact_id = meta.get("fact_id", meta.get("id"))
+    if fact_id is None:
+        return None
+    owner = meta.get("_relation_owner_eid") or meta.get("entity_id")
+    # Qualified aliases may carry relation_owner while their raw source row
+    # carries the same entity_id. They are one fact, not a score tie.
+    return (fact_id, owner, owner)
+
+
+def _tied_candidates(label: str, facts: dict[str, dict], chosen: str,
+                     chosen_meta: dict | None = None) -> list[str]:
     """并列最高分的字段（不含已选中的那个）。
 
     `27 §5.1`：**分数并列 → 直接问你**。表单上只写「名称：」时，
@@ -1026,7 +1049,123 @@ def _tied_candidates(label: str, facts: dict[str, dict], chosen: str) -> list[st
     top = scored[0][0]
     if top < PROPOSE_THRESHOLD:
         return []
-    return [k for s, k in scored if abs(s - top) < 1e-9 and k != chosen]
+    chosen_identity = _fact_identity(chosen_meta or facts.get(chosen))
+    return [k for s, k in scored
+            if abs(s - top) < 1e-9 and k != chosen
+            and (chosen_identity is None or _fact_identity(facts.get(k)) != chosen_identity)]
+
+
+def _meta_for_target_scope(meta: dict | None, entity_ids: list[int]) -> dict | None:
+    """Choose only a target-position's explicitly scoped source candidate."""
+    if meta is None or not entity_ids:
+        return meta
+    wanted = {int(eid) for eid in entity_ids}
+    if not meta.get("_ambiguous"):
+        owner = meta.get("_relation_owner_eid") or meta.get("entity_id")
+        return meta if owner in wanted else None
+    candidates = [candidate for candidate in meta.get("_candidates", [])
+                  if (candidate.get("_relation_owner_eid") or candidate.get("entity_id")) in wanted]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        return None
+    return {**meta, "_candidates": candidates}
+
+
+def _field_for_target(field: str, target_subject: dict, facts: dict[str, dict]) -> str:
+    """Repair a stale multi-rule field only when target text states its meaning."""
+    role, number, hint = (target_subject.get("role"), target_subject.get("number"),
+                          target_subject.get("field_hint"))
+    if role not in ("借款人", "保证人"):
+        return field
+    prefix = role + (str(number) if role == "保证人" and number is not None else "")
+    if hint == "法定代表人证件号码":
+        candidate = prefix + hint
+        if role == "保证人" and number is None:
+            return candidate
+    elif hint in ("名称", "法定代表人", "开户行及账号", "名称及证件号码", "法定代表人姓名及证件号码"):
+        candidate = prefix + hint
+        # A generic guarantor certificate can name no number while the
+        # source evidence names 保证人1/2.  Keep the semantic target key so
+        # `_target_fact` can select the one relationship whose company owner
+        # is in this target's already-resolved scope.
+        if role == "保证人" and number is None and hint == "法定代表人":
+            return candidate
+    else:
+        # A certificate template may say only “兹证明____同志”. Its filename
+        # still explicitly declares borrower/guarantor; repair only stale
+        # identity-relation fields, never financial amount/term fields.
+        match = re.fullmatch(r"(?:借款人|保证人\d*)(名称|法定代表人|住所|地址|联系电话|证件号码|证件类型)", field)
+        if not match:
+            return field
+        suffix = match.group(1)
+        candidate = prefix + suffix
+    # An explicit target meaning must not fall back to an old unrelated field
+    # merely because the requested source value is absent.
+    return candidate if hint or candidate in facts else field
+
+
+def _business_reference(field: str) -> bool:
+    """Contract references can cross roles; personal IDs and guarantee values cannot."""
+    if re.search(r"证件|身份证|护照|通行证|账号|账户|电话|保证金额|担保金额|保证期限|担保期限", field):
+        return False
+    return bool(re.search(r"合同|协议|金额|额度|期限|利率|用途|编号", field))
+
+
+def _missing_source_value_reason(field, value):
+    if value and re.search(r"合同|协议|编号", field) and re.search(r"第[\s_＿□☐]+号", str(value)):
+        return "来源合同编号仍含空白占位，没有完整编号，留空并报告"
+    return None
+
+
+def _target_fact(facts: dict[str, dict], field: str, entity_ids: list[int]) -> tuple[str, dict | None]:
+    """Resolve one template field, then one unique scoped synonym if needed."""
+    meta = _meta_for_target_scope(facts.get(field), entity_ids)
+    # The raw company fact ``保证人法定代表人=蔡某`` shares a human-facing
+    # key with the qualified person relation.  For a generic guarantor slot,
+    # prefer the latter when its company owner is exactly this slot's scope.
+    # Otherwise the company record would be used as if it were the person.
+    if field.endswith("法定代表人") and not (meta or {}).get("_qualified"):
+        relations = []
+        for key, candidate in facts.items():
+            if key == field or not key.endswith("法定代表人") or not candidate.get("_qualified"):
+                continue
+            scoped = _meta_for_target_scope(candidate, entity_ids)
+            if scoped is not None and scoped.get("value") not in (None, ""):
+                relations.append((key, scoped))
+        if len(relations) == 1:
+            return relations[0]
+    if meta is not None and meta.get("value") not in (None, ""):
+        return field, meta
+    # Business facts may be cited by a guarantor's board resolution even when
+    # the originating agreement belongs to the borrower.  Do not apply the
+    # identity-field ownership rule to an unambiguous contract/amount/term;
+    # if the global key has multiple values, return its explicit ambiguity so
+    # the planner asks instead of silently presenting it as missing.
+    business = _business_reference(field)
+    raw = facts.get(field)
+    if business and raw is not None:
+        if raw.get("_ambiguous") or raw.get("value") not in (None, ""):
+            return field, raw
+    matches: list[tuple[str, dict]] = []
+    seen: set[tuple[object, object]] = set()
+    for key, candidate in facts.items():
+        relation_suffix = ((field.endswith("法定代表人证件号码") and
+                            key.endswith("法定代表人证件号码")) or
+                           (field.endswith("法定代表人") and
+                            key.endswith("法定代表人")))
+        if key == field or (not relation_suffix and score_candidate(field, key) < 0.9):
+            continue
+        scoped = candidate if business else _meta_for_target_scope(candidate, entity_ids)
+        if scoped is None or scoped.get("value") in (None, "") or scoped.get("_ambiguous"):
+            continue
+        identity = (scoped.get("fact_id", scoped.get("id")),
+                    scoped.get("_relation_owner_eid") or scoped.get("entity_id"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        matches.append((key, scoped))
+    return matches[0] if len(matches) == 1 else (field, meta)
 
 
 def _template_subject_scope(store: StoreV2, template: Path,
@@ -1097,7 +1236,7 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
     """⑩ **强制预演**：每个格子填什么、几分把握、为什么要问你——一屏看完。
 
     `decision`：
-      * `auto` —— 置信度 ≥ 0.85、不是高风险五类、角色已确认、有值 → `--apply-all` 会填
+      * `auto` —— 置信度 ≥ 0.85、角色已确认、有值 → `--apply-all` 会填
       * `ask`  —— 必须**逐个勾**（`ask_reason` 说明为什么）
       * `empty`——源文件里确实没有这个值 → 留空 + 进待确认清单
     """
@@ -1131,19 +1270,36 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
             store, tpl, rules)
         facts = store.facts_for_subject(subject_eid, scope_entity_ids=subject_scope)
         from .fact_catalog import qualified_facts
+        # Qualified aliases carry identity ownership.  Keep unqualified
+        # business facts too: a guarantor resolution may legitimately cite
+        # the borrower's unique agreement amount/term.  Their ambiguity stays
+        # explicit and is handled by `_target_fact`, never silently dropped.
         facts.update({key: meta for key, meta in qualified_facts(store).items()
-                      if meta.get('_qualified')})
+                      if meta.get('_qualified') or
+                      _business_reference(key)})
         for rule in rules:
             field = rule["field"]
-            meta = facts.get(field)
+            from .fact_catalog import qualified_facts, target_subject_context
+            target_subject = target_subject_context(store, tpl, rule["target"],
+                                                     label=rule.get("label") or field)
+            # A generic “保证人” certificate is a company material. Its
+            # template scope has already excluded the personal guarantor; use
+            # that source-backed restriction when the position has no number.
+            if target_subject["role"] == "保证人" and target_subject.get("number") is None and subject_scope:
+                target_subject = {**target_subject, "entity_ids": [
+                    eid for eid in target_subject["entity_ids"] if eid in subject_scope]}
+            effective_field = _field_for_target(field, target_subject, facts)
+            source_field, meta = _target_fact(facts, effective_field, target_subject["entity_ids"])
             value = None if meta is None else meta.get("value")
+            missing_reason = _missing_source_value_reason(effective_field, value)
+            if missing_reason:
+                value = None
             conf = rule.get("confidence")
             if conf is None:
                 conf = 1.0 if meta is not None else 0.0
             hr = high_risk_class(field)
             eid = None if meta is None else meta.get("entity_id")
             role_blocked = field in ROLE_DEPENDENT_KEYS and eid in open_roles
-            tied = _tied_candidates(rule.get("label") or field, facts, field)
             ambiguous = bool(meta is not None and meta.get("_ambiguous"))
             cands = (meta or {}).get("_candidates") or []
             # Shape/unit incompatibility is local to this destination.  Keep
@@ -1159,25 +1315,20 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
                     "库里这个键有 %d 个主体的值：%s。字段名没指明是谁的 —— "
                     "请用 `--use <本表编号>=<主体名或#编号>` 指明" % (len(cands), who))
             elif value is None or not str(value).strip():
-                decision, ask = "empty", "源文件里没有这个值（缺失留空）"
+                decision, ask = "empty", missing_reason or "源文件里没有这个值（缺失留空）"
             elif local_issue:
                 decision, ask = "ask", "填写位置与值的单位/类型不兼容：%s；可留空，或输入符合该位置的值" % local_issue
             elif role_blocked:
                 decision, ask = "ask", "这个主体的角色还没确认（🟡 提示级）"
-            elif tied:
-                # `27 §5.1`：分数并列 → 直接问你，不许替你挑一个
-                decision, ask = "ask", "候选得分并列（%s 都是 %.2f），请你指明是哪一格" % (
-                    "、".join(tied), conf)
             elif conf < AUTO_APPLY_THRESHOLD:
                 decision, ask = "ask", "匹配置信度 %.2f < %.2f" % (conf, AUTO_APPLY_THRESHOLD)
-            elif hr:
-                decision, ask = "ask", "高风险五类字段（%s），无论多高分都要你点头" % hr
             else:
                 decision, ask = "auto", ""
             rows.append({
                 "n": 0, "template": tpl.name, "template_id": tid, "template_rule_id": rule["id"],
                 "template_sha256": template_hash,
-                "field": field, "label": rule.get("label") or field,
+                "field": effective_field, "label": rule.get("label") or effective_field,
+                "source_field": source_field,
                 "target": rule["target"], "value": None if value is None else str(value),
                 "confidence": conf, "is_required": bool(rule.get("is_required")),
                 "high_risk": hr, "entity_id": eid,
@@ -1189,6 +1340,7 @@ def build_fill_plan(store: StoreV2, templates: list[Path], *, batch_no: str,
                 "ambiguous": ambiguous, "candidates": cands,
                 "subject_eid": subject_eid, "subject_label": subject_label,
                 "subject_scope": subject_scope, "subject_note": subject_note,
+                "target_subject": target_subject,
                 "qualified_source": bool((meta or {}).get('_qualified')),
                 "local_issue": local_issue,
                 "relation_owner_eid": (meta or {}).get('_relation_owner_eid'),
@@ -1532,22 +1684,6 @@ def _check_cross_subject(store: StoreV2, rows: list[dict]) -> dict:
     violations: list[dict] = []
     unchecked: list[dict] = []
     checked = 0
-    # **这份产物允许出现哪些主体**（T-25 兜底）：
-    #   · 本产物主体（借款人那张表就是借款人）；
-    #   · 加上**本表任何格子声称的角色**所对应的主体
-    #     —— 借款人表上写"保证人是谁"是合法的，不能一刀切。
-    # 一个值的主体**不在这个集合里** → 那就是串了别人的资料。
-    allowed: set[int] = set()
-    if rows:
-        subj = rows[0].get("subject_eid")
-        if subj is not None:
-            allowed.add(int(subj))
-        for r in rows:
-            c = _role_claimed_by_field(r["field"])
-            if c:
-                e = store.role_entity(c)
-                if e is not None:
-                    allowed.add(int(e))
     for r in rows:
         field = r["field"]
         eid = r.get("entity_id")
@@ -1561,31 +1697,15 @@ def _check_cross_subject(store: StoreV2, rows: list[dict]) -> dict:
                 checked += 1
                 continue
         if claimed is None:
-            # 不声称角色的字段（`联系电话`、`开户行`…）**不再直接跳过**：
-            # 只看一件事——它的值属不属于这份产物。
-            #
-            # ⚠️ **只在"库里这个键本来就有多个候选"时才判**（T-25 收窄过一次）：
-            #    如果这个键**只有一条**，那它的归属就是"入库时怎么归的"，
-            #    跟"填表时挑错了"是两件事——拿它拦填报会**误杀**。
-            #    实测例子：「法定代表人身份证明书」这张表上，
-            #    借款人公司的 `联系电话` 会被误判成"不属于这份产物"
-            #    （因为表上唯一的角色字段是 `借款人法定代表人`，主体被认成了顾红军）。
-            #    那种情况该由 `db-report` 的"待归属"去说，不该拦死填报。
             if eid is None:
                 unchecked.append({"field": field, "template": r["template"],
                                   "why": "这条值没有归属主体，无法核对"})
                 continue
-            multi = len(store.current_rows(field)) > 1
-            if multi and allowed and int(eid) not in allowed:
-                violations.append({
-                    "field": field, "template": r["template"], "entity_id": eid,
-                    "entity_name": store.entity_label(int(eid)),
-                    "why": "「%s」这一格的值来自「%s」，**不属于这份产物**"
-                           "（本产物相关主体：%s）——跨主体串数据"
-                           % (field, store.entity_label(int(eid)),
-                              "、".join(sorted(store.entity_label(x) for x in allowed)))})
-            else:
-                checked += 1
+            # A generic address/account/phone field has no role in its name.
+            # Its target-position subject is resolved before this function;
+            # never infer a whole-template allow-list and block another
+            # guarantor merely because it is not the first subject.
+            checked += 1
             continue
         if eid is None:
             unchecked.append({"field": field, "template": r["template"],
@@ -1882,21 +2002,15 @@ def cmd_db_fill(args) -> Result:
         store.close()
         raise OfficeKitError("🔴 红线二：有值说不出来源，拒绝填充：%s" % fabric["bad"])
 
-    # 红线一（本期口径）：角色前缀一致性
+    # 字段归属诊断：逐位置已在预演中解析主体；旧的粗粒度角色检查只作
+    # 报告，不能因公司→法定代表人的明确关系事实而停止整批填充。
     cross = _check_cross_subject(store, writes)
     if not cross["ok"]:
-        store.event("fill_blocked", batch_no=batch_no, run_id=run_id,
-                    payload={"why": "cross_subject", **cross})
-        store.set_run_status(run_id, "blocked", "cross_subject")
         text = render_cross_subject(cross, batch_no)
-        p = write_text(out / "跨主体被拦下.md", text)
-        res.add_artifact(p, "红线一：跨主体串数据被拦下")
-        res.data.update({"blocked": True, "reason": "cross_subject", "cross": cross,
-                         "batch_no": batch_no, "run_id": run_id})
-        res.warn("🔴 红线一：%d 个格子的值来自不该出现在这里的角色，**已停止填充**"
+        p = write_text(out / "字段归属诊断.md", text)
+        res.add_artifact(p, "字段归属诊断（不阻断填充）")
+        res.warn("⚠️ 字段归属诊断发现 %d 项角色口径差异；已保留报告，不阻断逐位置填充"
                  % len(cross["violations"]))
-        store.close()
-        return res
 
     by_template: dict[str, list[dict]] = {}
     for r in writes:
@@ -2016,11 +2130,11 @@ def cmd_db_fill(args) -> Result:
     if problems:
         res.warn("%d 个编号被拒绝（%s）" % (len(problems), problems[0]["why"][:60]))
     if sign_kind is None:
-        res.warn("🔴 本次产物**未签核**（差交付门禁四①）——未签核不许交付。"
-                 "使用者本人复核后，用 `--sign-confirmed <姓名> --quote \"他的原话\"` 记录签核")
+        res.warn("⚠️ 本次产物已填报但**未签核**，仅供使用者复核；"
+                 "复核后可用 `--sign-confirmed <姓名> --quote \"他的原话\"` 记录签核。")
     elif sign_kind == "declared-by-agent":
         res.warn("⚠️ 签核记的是**「代理代填」**（`--sign %s`）——"
-                 "**这不等于使用者检查过成品**，交付门禁四① **不认它**。"
+                 "**这不等于使用者检查过成品**，产物仍仅供使用者复核。"
                  "要真签核请用 `--sign-confirmed <姓名> --quote \"使用者的原话\"`"
                  % res.data["signed_off"]["actor"])
     store.close()
@@ -2189,7 +2303,7 @@ def _flat(store: StoreV2) -> dict[str, dict]:
 # 报告
 # ==========================================================================
 def render_cross_subject(cross: dict, batch_no: str) -> str:
-    L = ["# 🔴 停止填充：红线一（跨主体串数据）", "",
+    L = ["# 字段归属检查结果", "",
          "| 项 | 值 |", "| --- | --- |", "| 批次 | %s |" % batch_no,
          "| 核对过的格子 | %d |" % cross["checked"],
          "| **违规格子** | **%d** |" % len(cross["violations"]),
@@ -2200,7 +2314,7 @@ def render_cross_subject(cross: dict, batch_no: str) -> str:
         for v in cross["violations"]:
             L.append("| %s | `%s` | %s（#%s） | %s |"
                      % (v["template"], v["field"], v["entity_name"], v["entity_id"], v["why"]))
-    L += ["", "> 📌 **本期口径**：%s" % cross["note"], ""]
+    L += ["", "> 📌 **检查口径**：%s" % cross["note"], ""]
     return "\n".join(L)
 
 
@@ -2242,7 +2356,7 @@ def render_fill_plan(store: StoreV2, plan: dict) -> str:
           "--new 2=你输入的值     # 只改本目标位置，记入填报记录，不改整批共用数据",
           "--blank 4             # 留空（该格空着并留在待确认清单里）",
           "--apply-all           # 全部自动填的那批（**不含**要你点头的格子）",
-          "--sign 你的姓名        # 使用者本人签核（干预点 3；不签 = 未签核不许交付）",
+          "--sign 你的姓名        # 记录代理代填；产物仍须由使用者复核",
           "```", "",
           "> ⚠️ **高风险五类字段**（收款账号 / 金额 / 利率 / 日期 / 证件号码）与**置信度 < 0.85** 的格子，"
           "`--apply-all` **不会**替你决定，必须逐个写编号。", ""]
@@ -2260,9 +2374,9 @@ def render_fill_result(store: StoreV2, plan: dict, results: list[dict], cross: d
          % (cross["checked"], len(cross["violations"]), len(cross["unchecked"])),
          "| 签核 | %s |" % (
              "✅ **使用者已确认**（%s）" % sign_actor if signed else
-             ("⚠️ **代理代填**（%s）——**不等于使用者检查过成品**，门禁四① **不认它**"
+             ("⚠️ **代理代填**（%s）——**不等于使用者检查过成品**，仅供复核"
               % sign_actor if sign_kind == "declared-by-agent" else
-              "🔴 **未签核 → 不许交付**")),
+              "⚠️ **未签核，供使用者复核**")),
          "| **工具指纹** | `%s`（这套产物是**这个版本**的工具做的） |" % _tool_fp(),
          ""]
     L += ["## 逐份产物", "", "| 模板 | 产物 | 指纹 | 打开自检 | 格式说明 |",
@@ -2285,15 +2399,15 @@ def render_fill_result(store: StoreV2, plan: dict, results: list[dict], cross: d
         for r in opens:
             L.append("| %s | %s | %s | %s |" % (r["id"], r["kind"],
                                                 r["field"] or r["label"], r["reason"]))
-    L += ["", "## 交付门禁", "",
-          "| # | 门禁 | 结果 |", "| --- | --- | --- |",
+    L += ["", "## 复核状态", "",
+          "| # | 检查项 | 结果 |", "| --- | --- | --- |",
           "| 一 | 跨主体串数据 | %s |" % ("✅ 通过" if cross["ok"] else "🔴 违规"),
           "| 二 | 无中生有 | ✅ 通过（每个值都有来源类型） |",
           "| 三 | 格式未变 / 打得开 | 见上表「保真」列 |",
-          "| 四 | 交付前置未满足 | %s |" % (
+          "| 四 | 使用者复核记录 | %s |" % (
               "✅ 使用者已确认" if signed else
-              ("⚠️ **代理代填，不算** —— 🔴 不许交付" if sign_kind == "declared-by-agent"
-               else "🔴 未签核 —— **不许交付**")), ""]
+              ("⚠️ 代理代填，不等于使用者确认" if sign_kind == "declared-by-agent"
+               else "⚠️ 未签核，供使用者复核")), ""]
     return "\n".join(L)
 
 

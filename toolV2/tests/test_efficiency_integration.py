@@ -24,7 +24,7 @@ def answer(result):
 
 
 class EfficiencyIntegrationTests(unittest.TestCase):
-    def test_aliases_share_one_native_question_and_reuse_answer(self):
+    def test_certain_aliases_fill_without_extra_question_and_reuse_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
             doc = Document(); doc.add_paragraph('借款人名称：合成别名公司')
@@ -45,10 +45,10 @@ class EfficiencyIntegrationTests(unittest.TestCase):
                                 'mapping_read': {'section': 'positions', 'template': name}})
                 updates.append({'template': name, 'field': field, 'slot_id': page['mapping_page']['items'][0]['id']})
             ready = request({'action': 'update_positions', 'work': str(work), 'task_id': result['task_id'], 'updates': updates})
-            self.assertEqual('awaiting_fill', ready['status'], ready)
-            self.assertEqual(1, len(ready['questions']), ready['questions'])
-            self.assertIn('first.docx', ready['questions'][0]['detail'])
-            self.assertIn('second.docx', ready['questions'][0]['detail'])
+            self.assertEqual('completed', ready['status'], ready)
+            self.assertEqual([], ready['questions'])
+            for result_row in ready['results']:
+                self.assertIn('13800000000', Document(result_row['output']).paragraphs[0].text)
             completed = answer(ready)
             self.assertEqual('completed', completed['status'], completed)
             repeated = request(payload)

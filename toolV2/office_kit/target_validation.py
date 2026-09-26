@@ -3,11 +3,54 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from .common import OfficeKitError
 from .value_fit import value_fit_issue
 
 _BLANK_MARKS = "_＿-—.·…□☐"
+_READ_CACHE = ContextVar('template_validation_cache', default=None)
+
+
+@contextmanager
+def template_read_cache():
+    """Share parsed, read-only templates during one workflow request only."""
+    cache = {}
+    token = _READ_CACHE.set(cache)
+    try:
+        yield
+    finally:
+        for (kind, *_), value in cache.items():
+            if kind == 'xlsx':
+                value.close()
+        _READ_CACHE.reset(token)
+
+
+def _read_template(path, kind):
+    path = Path(path).resolve()
+    stamp = path.stat()
+    key = (kind, str(path), stamp.st_mtime_ns, stamp.st_size)
+    cache = _READ_CACHE.get()
+    if cache is not None and key in cache:
+        return cache[key]
+    if kind == 'word':
+        from .doc_fill import XmlEngine
+        result = XmlEngine(path)
+    else:
+        import openpyxl
+        result = openpyxl.load_workbook(path, read_only=False, data_only=False)
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+def read_word_template(path):
+    return _read_template(path, 'word')
+
+
+def read_excel_template(path):
+    return _read_template(path, 'xlsx')
 
 
 def _blank_slot(text: str) -> bool:
@@ -30,7 +73,7 @@ def _word_target(path: Path, target: dict[str, Any]) -> dict[str, Any]:
         required = ("table", "row", "col")
         if any(k not in target for k in required):
             raise OfficeKitError("cell 目标必须同时提供 table、row、col")
-        engine = XmlEngine(path)
+        engine = read_word_template(path)
         try:
             table_i, row_i, col_i = (int(target[k]) for k in ("table", "row", "col"))
         except (TypeError, ValueError) as exc:
@@ -62,7 +105,7 @@ def _word_target(path: Path, target: dict[str, Any]) -> dict[str, Any]:
             int(target["span_end"])
         except (TypeError, ValueError) as exc:
             raise OfficeKitError("paragraph_index/span_start/span_end 必须是整数") from exc
-    engine = XmlEngine(path)
+    engine = read_word_template(path)
     hits = engine.find_anchor_hits(target)
     if not hits:
         raise OfficeKitError("找不到指定填写位置")
@@ -87,7 +130,7 @@ def _xlsx_target(path: Path, target: dict[str, Any]) -> dict[str, Any]:
         raise OfficeKitError("xlsx_cell 目标必须提供 cell")
     if "pattern" in target:
         raise OfficeKitError("xlsx_cell 不支持 pattern，只能使用 anchor/before")
-    wb = openpyxl.load_workbook(str(path), read_only=False, data_only=False)
+    wb = read_excel_template(path)
     try:
         sheet = target.get("sheet")
         try:
@@ -161,7 +204,7 @@ def value_target_issue(path: str | Path, target: dict[str, Any], value: str) -> 
     try:
         if path.suffix.lower() == ".docx" and target.get("kind") == "anchor":
             from .doc_fill import XmlEngine, paragraph_text
-            engine = XmlEngine(path)
+            engine = read_word_template(path)
             for par, start, end in engine.find_anchor_hits(target):
                 raw = engine.xml_for(par)
                 issue = value_fit_issue(raw.text if raw is not None else paragraph_text(par), start, end, value)
@@ -169,7 +212,7 @@ def value_target_issue(path: str | Path, target: dict[str, Any], value: str) -> 
                     return issue
         elif path.suffix.lower() == ".xlsx" and target.get("kind") == "xlsx_cell":
             import openpyxl
-            wb = openpyxl.load_workbook(str(path), read_only=True, data_only=False)
+            wb = read_excel_template(path)
             try:
                 ws = wb[str(target.get("sheet"))] if target.get("sheet") is not None else wb.worksheets[0]
                 text = "" if ws[str(target["cell"])].value is None else str(ws[str(target["cell"])].value)
@@ -196,7 +239,7 @@ def target_structure_issue(path: str | Path, target: dict[str, Any]) -> str | No
         return None
     try:
         import openpyxl
-        wb = openpyxl.load_workbook(str(path), read_only=False, data_only=False)
+        wb = read_excel_template(path)
         try:
             ws = wb[str(target.get("sheet"))] if target.get("sheet") is not None else wb.worksheets[0]
             cell = ws[str(target["cell"])]

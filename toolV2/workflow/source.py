@@ -6,7 +6,9 @@ from . import source_conflicts
 
 # Increment when source interpretation changes, so saved tasks do not silently
 # keep an older parser's ownership suggestions. Answer identities stay separate.
-SOURCE_PARSE_VERSION = 4
+# v5: numbered guarantor sections retain their own current owner instead of
+# letting a later “保证人2” overwrite the fields following “保证人1”.
+SOURCE_PARSE_VERSION = 5
 # Parser refresh must not erase unchanged user decisions. Evidence/ownership
 # changes already produce different identities; retain the prior answer schema.
 SOURCE_ANSWER_VERSION = 3
@@ -15,6 +17,9 @@ SOURCE_ANSWER_VERSION = 3
 def prepare(store, work, task):
     signatures = [(p, sha256_file(inside(work, p))) for p in task['source']]
     signature = digest([SOURCE_PARSE_VERSION, signatures])
+    task['source_content_signature'] = digest(signatures)
+    task['equivalent_source_signatures'] = [digest([version, signatures])
+                                            for version in range(1, SOURCE_PARSE_VERSION + 1)]
     if task.get('source_signature') == signature and task.get('source_ready'):
         return []
     rows = []

@@ -145,7 +145,7 @@ class SourceRoleTests(unittest.TestCase):
         self.assertNotIn("居民身份证", generic_question["question"])
 
     def test_source_question_shows_file_original_quote_and_context_basis(self) -> None:
-        write_docx(self.source, "借款人：合成借款公司", "联系电话：13800000000")
+        write_docx(self.source, "联系电话：13800000000")
         write_docx(self.target, "联系电话：")
         started = request(self.payload())
         self.assertEqual("awaiting_source", started["status"], started)
@@ -153,7 +153,7 @@ class SourceRoleTests(unittest.TestCase):
         question = started["questions"][0]["question"]
         self.assertIn(self.source.name, question)
         self.assertIn("联系电话：13800000000", question)
-        self.assertTrue(any(marker in question for marker in ("上下文", "推荐", "借款人")), question)
+        self.assertTrue(any(marker in question for marker in ("上下文", "主体", "归属")), question)
 
     def test_same_subject_different_values_becomes_native_conflict_review_and_recovers(self) -> None:
         write_docx(self.source, "借款人：合成借款公司",

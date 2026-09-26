@@ -1,5 +1,8 @@
 from pathlib import Path
 
+from docx import Document
+
+from office_kit.fact_catalog import target_subject_context
 from office_kit.harness import _guard_fill, _template_subject_scope
 from office_kit.store_v2 import StoreV2
 
@@ -130,5 +133,60 @@ def test_mixed_role_declaration_leaves_candidates_visible_for_a_question(tmp_pat
         phone = store.facts_for_subject(eid, scope_entity_ids=scope)["联系电话"]
         assert phone["_ambiguous"] is True
         assert len(phone["_candidates"]) == 3
+    finally:
+        store.close()
+
+
+def test_table_position_uses_numbered_guarantor_evidence_not_role_order(tmp_path):
+    store, borrower, _personal, company_one, company_two = _store(tmp_path)
+    try:
+        store.set_role(company_one, "保证人", evidence="保证人1：合成保证主体一", batch_no="20260925-01")
+        store.set_role(company_two, "保证人", evidence="保证人2：合成保证主体二", batch_no="20260925-01")
+        template = tmp_path / "核保书.docx"
+        doc = Document(); table = doc.add_table(rows=2, cols=2)
+        table.cell(0, 0).text = "担保人2"
+        table.cell(1, 0).text = "地址"
+        doc.save(template)
+        context = target_subject_context(store, template,
+                                         {"kind": "cell", "table": 0, "row": 1, "col": 1},
+                                         label="地址")
+        assert context["role"] == "保证人"
+        assert context["number"] == 2
+        assert context["entity_ids"] == [company_two]
+        assert borrower not in context["entity_ids"]
+    finally:
+        store.close()
+
+
+def test_anonymous_repeated_position_does_not_default_to_unique_borrower(tmp_path):
+    store, _borrower, _personal, _company_one, _company_two = _store(tmp_path)
+    try:
+        template = tmp_path / "甲表.docx"
+        doc = Document(); doc.add_paragraph("法定代表人：____"); doc.add_paragraph("法定代表人：____")
+        doc.save(template)
+        context = target_subject_context(store, template,
+                                         {"kind": "anchor", "part": "word/document.xml",
+                                          "paragraph_index": 1,
+                                          "expected_text": "法定代表人：____", "span_start": 6, "span_end": 10})
+        assert context["role"] is None
+        assert context["entity_ids"] == []
+    finally:
+        store.close()
+
+
+def test_generic_guarantor_representative_inherits_nearest_number_but_own_hint(tmp_path):
+    store, _borrower, _personal, _company_one, company_two = _store(tmp_path)
+    try:
+        store.set_role(company_two, "保证人", evidence="保证人2：合成保证主体二", batch_no="20260925-01")
+        template = tmp_path / "核保书.docx"
+        doc = Document(); doc.add_paragraph("担保人2："); doc.add_paragraph("担保人法定代表人或授权代理人身份证号：")
+        doc.save(template)
+        context = target_subject_context(store, template,
+                                         {"kind": "anchor", "part": "word/document.xml",
+                                          "paragraph_index": 1,
+                                          "expected_text": "担保人法定代表人或授权代理人身份证号：",
+                                          "span_start": 17, "span_end": 17})
+        assert (context["role"], context["number"], context["field_hint"]) == ("保证人", 2, "法定代表人")
+        assert context["entity_ids"] == [company_two]
     finally:
         store.close()

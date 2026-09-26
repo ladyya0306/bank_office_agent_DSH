@@ -17,7 +17,7 @@ from .xml_fill import scan_paragraphs
 
 _PART_RE = re.compile(r"word/(?:document|header\d+|footer\d+)\.xml$")
 _UNDERLINE_RE = re.compile(r"_{2,}")
-_BRACKET_RE = re.compile(r"(?<=[(（])[ _\u3000]*(?=[)）])")
+_BRACKET_RE = re.compile(r"(?<=[(（【])[ _\u3000]*(?=[)）】])")
 _COLON_END_RE = re.compile(r"[：:]([ \u3000]*)$")
 _LABEL_RE = re.compile(r"(?:^|[\n，、；;。])\s*([^\n，、；;。:：]{1,40})[：:]")
 _PROTECTED_RE = re.compile(r"签字|签名|签章|盖章|签核|审批|审核|经办人|法定代表人.{0,8}(?:签|章)")
@@ -96,7 +96,15 @@ def _underlined_space_spans(paragraph: Any, xml: bytes) -> set[tuple[int, int]]:
         cursor = pos + len(run_text)
         if b"<w:u" not in run.group(1):
             continue
+        has_printed_text = bool(run_text.strip())
         for match in re.finditer(r" +", run_text):
+            # In a run that already contains printed text, leading/trailing
+            # underlined spaces are visual padding around that text.  Keep
+            # interior gaps, which may carry actual fill-in meaning, and keep
+            # every space in a whitespace-only underlined run.
+            if has_printed_text and not (run_text[:match.start()].strip()
+                                         and run_text[match.end():].strip()):
+                continue
             result.add((pos + match.start(), pos + match.end()))
     return result
 
@@ -125,7 +133,8 @@ def _short_table_label(value: str) -> str | None:
     return compact
 
 
-def _paragraph_slots(part: str, paragraphs: list[Any], xml: bytes) -> list[dict[str, Any]]:
+def _paragraph_slots(part: str, paragraphs: list[Any], xml: bytes,
+                     suppress_colon_insertions: set[int] | None = None) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     for index, paragraph in enumerate(paragraphs):
         raw = paragraph.text
@@ -149,7 +158,8 @@ def _paragraph_slots(part: str, paragraphs: list[Any], xml: bytes) -> list[dict[
         # an insertion span is still precise and is handled by the XML writer.
         for match in _COLON_END_RE.finditer(raw):
             label = _label(raw, match.start())
-            if label and not _SECTION_LABEL_RE.search(label):
+            if (index not in (suppress_colon_insertions or set())
+                    and label and not _SECTION_LABEL_RE.search(label)):
                 spans.add((match.end(), match.end()))
         for start, end in _normalise_spans(spans):
             if start == end and not raw[:start].strip():
@@ -208,13 +218,51 @@ def _word_cell_slots(path: Path) -> list[dict[str, Any]]:
     return results
 
 
+def _table_label_paragraph_indices(path: Path, paragraphs: list[Any]) -> set[int]:
+    """Find trailing-colon paragraphs in table labels with an adjacent blank cell."""
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    document = Document(str(path))
+    xml_paragraphs = list(document._element.body.iter(qn("w:p")))
+    paragraph_index = {id(element): index for index, element in enumerate(xml_paragraphs)}
+    suppress: set[int] = set()
+    for table in document.tables:
+        for row in table.rows:
+            seen: set[Any] = set()
+            previous_label = None
+            for cell in row.cells:
+                if cell._tc in seen:
+                    continue
+                seen.add(cell._tc)
+                text = cell.text.strip()
+                if not text:
+                    if previous_label is not None:
+                        for paragraph in previous_label.paragraphs:
+                            raw = paragraph.text
+                            if raw.rstrip().endswith(("：", ":")):
+                                index = paragraph_index.get(id(paragraph._p))
+                                if index is not None:
+                                    suppress.add(index)
+                    previous_label = None
+                else:
+                    previous_label = cell if _short_table_label(text) else None
+    # Keep the argument's ordered parser view in the signature so callers can
+    # confirm these indices refer to the same body paragraph sequence.
+    return {index for index in suppress if index < len(paragraphs)}
+
+
 def _word_slots(path: Path) -> list[dict[str, Any]]:
     with zipfile.ZipFile(path) as package:
         parts = sorted(name for name in package.namelist() if _PART_RE.fullmatch(name))
+        document_paragraphs = scan_paragraphs(package.read("word/document.xml"))
+        suppress = _table_label_paragraph_indices(path, document_paragraphs)
         slots = []
         for part in parts:
             xml = package.read(part)
-            slots.extend(_paragraph_slots(part, scan_paragraphs(xml), xml))
+            paragraphs = scan_paragraphs(xml)
+            slots.extend(_paragraph_slots(part, paragraphs, xml,
+                                          suppress if part == "word/document.xml" else None))
     slots.extend(_word_cell_slots(path))
     return slots
 
@@ -223,17 +271,50 @@ def _excel_label(value: str) -> str:
     return value.strip().lstrip("*＊").rstrip("：:").strip() or "待确认空位"
 
 
+def _label_replacements(sheet: Any, label_cell: Any, raw: str) -> list[dict[str, Any]]:
+    """Describe legacy label-cell rules that the new right-value slot replaces."""
+    colon_end = len(raw.rstrip())
+    replacements = [{"kind": "xlsx_cell", "sheet": sheet.title,
+                     "cell": label_cell.coordinate, "anchor": raw.strip()}]
+    replacements.append({"kind": "xlsx_cell", "sheet": sheet.title,
+                         "cell": label_cell.coordinate, "expected_text": raw,
+                         "span_start": colon_end, "span_end": colon_end})
+    return replacements
+
+
 def _xlsx_slots(path: Path) -> list[dict[str, Any]]:
     import openpyxl
+    from .value_fit import unit_wrapper_span
 
     book = openpyxl.load_workbook(path, read_only=False, data_only=False)
     results: list[dict[str, Any]] = []
     try:
         for sheet in book.worksheets:
-            for cell in list(sheet._cells.values()):
+            cells = list(sheet._cells.values())
+            # A compact label such as "本次业务金额：" can point at a right
+            # cell that already contains a unit wrapper and blank ("人民币   万元").
+            # Recognise that physical value cell before scanning standalone cell
+            # text so the label and the wrapper become one addressable position.
+            possible_pairs: dict[str, list[tuple[Any, str, tuple[int, int]]]] = {}
+            for label_cell in cells:
+                raw_label = label_cell.value
+                if not isinstance(raw_label, str) or not raw_label.rstrip().endswith(("：", ":")):
+                    continue
+                merged = next((r for r in sheet.merged_cells.ranges
+                               if label_cell.coordinate in r), None)
+                next_col = merged.max_col + 1 if merged else label_cell.column + 1
+                value_cell = sheet.cell(label_cell.row, next_col)
+                span = unit_wrapper_span(value_cell.value)
+                if span:
+                    possible_pairs.setdefault(value_cell.coordinate, []).append(
+                        (label_cell, raw_label, span))
+            label_pairs = {coord: pairs[0] for coord, pairs in possible_pairs.items()
+                           if len(pairs) == 1}
+            for cell in cells:
                 if not isinstance(cell.value, str):
                     continue
                 raw = cell.value
+                paired = label_pairs.get(cell.coordinate)
                 context = {"previous": "", "paragraph": _bounded(raw), "next": f"工作表 {sheet.title}"}
                 spans = set(m.span() for m in _UNDERLINE_RE.finditer(raw)) | set(m.span() for m in _BRACKET_RE.finditer(raw))
                 for match in _SUFFIX_RE.finditer(raw):
@@ -241,15 +322,21 @@ def _xlsx_slots(path: Path) -> list[dict[str, Any]]:
                 for match in _COLON_END_RE.finditer(raw):
                     if not _SECTION_LABEL_RE.search(_label(raw, match.start())): spans.add((match.end(), match.end()))
                 for start, end in _normalise_spans(spans):
-                    label = _label(raw, start)
+                    is_paired_span = bool(paired and (start, end) == paired[2])
+                    label = _excel_label(paired[1]) if is_paired_span else _label(raw, start)
                     protected, reason = _protected(raw, label, start, end)
                     # XlsxEngine addresses a cell and a character span directly;
                     # it cannot execute Word's part/paragraph anchor protocol.
                     target = {"kind": "xlsx_cell", "sheet": sheet.title, "cell": cell.coordinate,
                               "expected_text": raw, "span_start": start, "span_end": end}
+                    if is_paired_span:
+                        target["label_cell"] = paired[0].coordinate
                     key = json.dumps(target, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                    results.append({"id": hashlib.sha256(key.encode()).hexdigest()[:20], "label": label, "context": context,
-                                    "target": target, "protected": protected, "protected_reason": reason})
+                    slot = {"id": hashlib.sha256(key.encode()).hexdigest()[:20], "label": label, "context": context,
+                            "target": target, "protected": protected, "protected_reason": reason}
+                    if is_paired_span:
+                        slot["replaces_targets"] = _label_replacements(sheet, paired[0], paired[1])
+                    results.append(slot)
                 # Adjacent blanks are considered only for an explicit label; this
                 # deliberately does not invent rows for ordinary spreadsheet data.
                 if raw.rstrip().endswith(("：", ":")):
