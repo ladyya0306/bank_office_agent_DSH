@@ -14,6 +14,7 @@
 /toolV2/*
 !/toolV2/AGENTS.md
 !/toolV2/README.md
+!/toolV2/MAINTENANCE.md
 !/toolV2/engine-origin.json
 !/toolV2/office.py
 !/toolV2/install.py
