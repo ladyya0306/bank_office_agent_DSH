@@ -4,9 +4,12 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { prepareToolV2, portableWorkspace } = require('./tool-v2-startup.cjs');
+const { openRuntimeLogs } = require('./runtime-logging.cjs');
+const logs = openRuntimeLogs(__dirname);
+process.on('exit', () => logs.close());
 
 const toolStatus = prepareToolV2(__dirname);
-console.log(toolStatus.changed ? 'toolV2 接入已更新。' : 'toolV2 接入检查通过。');
+logs.info(toolStatus.changed ? 'toolV2 接入已更新。' : 'toolV2 接入检查通过。');
 process.env.WORKSPACE_DIR = portableWorkspace(__dirname, process.env.WORKSPACE_DIR);
 
 const args = process.argv.slice(2);
@@ -58,8 +61,9 @@ if (isDev) {
   dshArgs.push('--dev');
 }
 
-console.log('Starting DeepSeek Harness...');
-console.log('Config:', {
+logs.info('Starting DeepSeek Harness...');
+logs.info('Runtime logs:', logs.directory);
+logs.info('Config:', {
   port: process.env.PORT || '3080 (default)',
   host: process.env.HOST || '127.0.0.1 (default)',
   workspace: process.env.WORKSPACE_DIR || './workspace (default)',
@@ -71,16 +75,19 @@ console.log('Config:', {
 const localCli = path.join(__dirname, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 if (!fs.existsSync(localCli)) throw new Error('本机 DSH 运行文件不完整；请补齐离线部署包中的 node_modules。');
 const dsh = spawn(process.execPath, [localCli, ...dshArgs], {
-  stdio: 'inherit',
+  stdio: ['inherit', 'pipe', 'pipe'],
   shell: false,
   env
 });
+dsh.stdout.on('data', chunk => logs.stdout(chunk));
+dsh.stderr.on('data', chunk => logs.stderr(chunk));
 
 dsh.on('error', (err) => {
-  console.error('Failed to start:', err.message);
+  logs.error('Failed to start:', err.message);
   process.exit(1);
 });
 
 dsh.on('close', (code) => {
-  process.exit(code || 0);
+  logs.close();
+  process.exitCode = code || 0;
 });
