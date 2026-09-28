@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "description": "Local deployment of DeepSeek Harness",
   "scripts": {
+    "setup-qwen": "node setup-qwen.cjs",
+    "local-qwen": "node local-qwen.cjs",
     "postinstall": "node patch-fence.cjs",
     "patch": "node patch-fence.cjs",
     "start": "node patch-fence.cjs && node start.js --session-office-gate",

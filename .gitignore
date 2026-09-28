@@ -39,6 +39,8 @@
 !/deepseek-harness-local/question-detail.cjs
 !/deepseek-harness-local/tool-v2-startup.cjs
 !/deepseek-harness-local/runtime-logging.cjs
+!/deepseek-harness-local/setup-qwen.cjs
+!/deepseek-harness-local/local-qwen.cjs
 !/deepseek-harness-local/tests/
 !/deepseek-harness-local/workspace/
 /deepseek-harness-local/workspace/*
