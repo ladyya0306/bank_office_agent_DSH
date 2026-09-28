@@ -14,6 +14,16 @@ const DEFAULTS = Object.freeze({
   alias: 'local-qwen3-1.7b',
 });
 
+const QWEN4_DEFAULTS = Object.freeze({
+  serverPath: DEFAULTS.serverPath,
+  modelPath: '',
+  port: 18082,
+  context: 32768,
+  threads: 6,
+  maxOutput: DEFAULTS.maxOutput,
+  alias: 'local-qwen3-4b-instruct-2507',
+});
+
 function integer(value, name, minimum, maximum) {
   if (!/^[0-9]+$/.test(String(value))) throw new Error(`${name} 必须是整数。`);
   const parsed = Number(value);
@@ -35,16 +45,21 @@ function existingFile(value, name, extension) {
   return resolved;
 }
 
-function readConfig(env = process.env) {
+function readConfig(env = process.env, options = {}) {
+  const defaults = options.defaults || DEFAULTS;
+  const names = options.names || {
+    serverPath: 'LOCAL_QWEN_SERVER', modelPath: 'LOCAL_QWEN_MODEL_PATH', port: 'LOCAL_QWEN_PORT',
+    context: 'LOCAL_QWEN_CONTEXT', threads: 'LOCAL_QWEN_THREADS', apiKey: 'LOCAL_QWEN_API_KEY',
+  };
   return {
-    serverPath: existingFile(env.LOCAL_QWEN_SERVER || DEFAULTS.serverPath, 'LOCAL_QWEN_SERVER'),
-    modelPath: existingFile(env.LOCAL_QWEN_MODEL_PATH || DEFAULTS.modelPath, 'LOCAL_QWEN_MODEL_PATH', '.gguf'),
-    port: integer(env.LOCAL_QWEN_PORT || DEFAULTS.port, 'LOCAL_QWEN_PORT', 1, 65535),
-    context: integer(env.LOCAL_QWEN_CONTEXT || DEFAULTS.context, 'LOCAL_QWEN_CONTEXT', 1024, 32768),
-    threads: integer(env.LOCAL_QWEN_THREADS || DEFAULTS.threads, 'LOCAL_QWEN_THREADS', 1, 256),
-    maxOutput: DEFAULTS.maxOutput,
-    alias: DEFAULTS.alias,
-    apiKey: env.LOCAL_QWEN_API_KEY,
+    serverPath: existingFile(env[names.serverPath] || defaults.serverPath, names.serverPath),
+    modelPath: existingFile(env[names.modelPath] || defaults.modelPath, names.modelPath, '.gguf'),
+    port: integer(env[names.port] || defaults.port, names.port, 1, 65535),
+    context: integer(env[names.context] || defaults.context, names.context, 1024, 32768),
+    threads: integer(env[names.threads] || defaults.threads, names.threads, 1, 256),
+    maxOutput: defaults.maxOutput,
+    alias: defaults.alias,
+    apiKey: env[names.apiKey],
   };
 }
 
@@ -107,4 +122,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { DEFAULTS, readConfig, buildServerArgs, launch };
+module.exports = { DEFAULTS, QWEN4_DEFAULTS, readConfig, buildServerArgs, launch };

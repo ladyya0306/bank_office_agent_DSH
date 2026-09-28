@@ -69,3 +69,5 @@
 **/*.pdf
 **/*.png
 **/*.jpg
+
+!/deepseek-harness-local/local-qwen-autostart.cjs

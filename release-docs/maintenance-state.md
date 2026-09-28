@@ -4,10 +4,12 @@
 
 2026-09-28补充：`improve/qwen-models`增加百炼Qwen Plus及本地Qwen3-1.7B模型选项，已安装到日常DSH；保留Flash默认，不改toolV2。7项相关检查、网页模型目录、本地中文及流式工具调用验证通过；百炼待用户填北京地域API Key，尚未发起云端测试，未执行小模型15模板验收。操作与回退见[Qwen使用说明](Qwen模型切换与测试_20260928.md)。
 
+2026-09-28晚补充：新增本地Qwen3-4B Instruct 2507 Q4_K_M，模型已下载到D:\DSH\model并通过固定SHA-256校验；运行程序b10964也放入该目录。日常npm start自动启动4B，旧Flash/百炼/1.7B保留，不改toolV2业务逻辑。19项相关自动检查通过；真实加载约4.9秒，模型接口未认证401/认证200。DSH命令行实际调用skill并成功加载office-suite，随后正确回答office_fill_task，375.36秒、18,926 token（含8,148缓存读取）；网页合成填表未完成，不声称达到Flash原15份结果。启动分工实际使用gpt-5.6-terra，主代理负责整合和实测。
+
 ## 版本与环境
 
 - 填报修复代码：`1c4fb80`；启动日志：`6af4d08`。原交接标签`toolv2-handoff-20260927`保留；首版目录/部署说明快照为`toolv2-guide-20260927`；本轮通俗操作及缓存说明快照为`toolv2-guide-plain-20260927`，本次仅改文档，不改变填报引擎。
-- GitHub：`https://github.com/ladyya0306/bank_office_agent_DSH`，公开仓库。当前维护分支：`improve/fill-efficiency`；`main`保留此前版本，不是最新维护入口。
+- GitHub：`https://github.com/ladyya0306/bank_office_agent_DSH`，公开仓库。填报基线分支：`improve/fill-efficiency`；模型接入维护分支：`improve/qwen-models`；`main`保留此前版本，不是最新维护入口。
 - 本机日常运行目录：`D:\DSH`。本机干净维护工作树：`D:\DSH-worktrees\fill-efficiency`。另一项目`D:\MiniProj\bank-office-agent-mvp`的设计文件不等于这里已经实现的能力。
 - 上轮DSH实测为DeepSeek-V41-Flash/High；Windows本机验证不代表本地小模型或其他办公终端已通过。
 

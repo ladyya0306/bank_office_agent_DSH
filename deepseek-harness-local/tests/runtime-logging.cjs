@@ -36,7 +36,7 @@ test('preserves UTF-8 byte chunks and stderr, mirrors output, never overwrites a
 
 function installFakeLauncher(root) {
   const harness = path.join(root, 'harness'); fs.mkdirSync(harness);
-  for (const name of ['start.js', 'runtime-logging.cjs']) {
+  for (const name of ['start.js', 'runtime-logging.cjs', 'local-qwen.cjs', 'local-qwen-autostart.cjs']) {
     fs.copyFileSync(path.join(__dirname, '..', name), path.join(harness, name));
   }
   fs.writeFileSync(path.join(harness, 'tool-v2-startup.cjs'), `exports.prepareToolV2=()=>({changed:false}); exports.portableWorkspace=root=>root;`);

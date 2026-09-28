@@ -45,3 +45,12 @@ test('invalid configuration fails instead of writing a broken route', () => {
   assert.throws(() => profiles({ DASHSCOPE_BASE_URL: 'http://example.com' }));
   assert.throws(() => updateSettings('wrong: [', profiles({})));
 });
+
+test('4B route is separate and leaves 1.7B intact', () => {
+  const routes = profiles({ LOCAL_QWEN4_PORT: '18084', LOCAL_QWEN4_CONTEXT: '16384' });
+  assert.equal(routes['local-qwen4'].baseURL, 'http://127.0.0.1:18084/v1');
+  assert.equal(routes['local-qwen4'].models[0].contextWindow, 16384);
+  assert.equal(routes['local-qwen4'].models[0].id, 'local-qwen3-4b-instruct-2507');
+  assert.equal(routes['local-qwen'].models[0].id, 'local-qwen3-1.7b');
+  assert.throws(() => profiles({ LOCAL_QWEN4_CONTEXT: '2048' }));
+});
