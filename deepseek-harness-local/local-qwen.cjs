@@ -94,6 +94,9 @@ function launch(config, root = __dirname) {
   process.once('SIGINT', () => stop('Ctrl+C'));
   process.once('SIGTERM', () => stop('SIGTERM'));
   process.stdout.write(`正在启动本地 Qwen，等待模型加载；日志目录：${logs.directory}\n`);
+  logs.info('注意：18081是模型接口，不是聊天网页；直接打开接口首页返回404不表示模型故障。');
+  logs.info('请保持此窗口开启，另开PowerShell，在DSH目录运行 npm start。它会打开带登录授权的DSH网页（默认3080端口）。');
+  logs.info('进入DSH后，在模型菜单选择“Qwen3-1.7B Q8_0 · 本地实验”。');
   return child;
 }
 
