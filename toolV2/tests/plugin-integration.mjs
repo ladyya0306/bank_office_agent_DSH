@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -35,12 +35,28 @@ try {
     return { cancelled: true };
   } });
   assert.equal(cancelled.status, 'cancelled');
+  await writeFile(path.join(work, 'reader.py'), '# Synthetic proposed reader; never executed in this cancellation test.\n');
+  let methodCards = 0;
+  const rejectedMethod = await runOfficeFill({work, task_id: cancelled.task_id,
+    learning: {action: 'propose', name: '合成来源读取方法', script_path: 'reader.py'}}, {
+    ...ports,
+    ask: async ({questions}) => {
+      methodCards += 1;
+      assert.ok(questions.every(q => q.id.startsWith('method-')),
+        'Rejecting a method must not immediately ask the old source questions');
+      return {answers: questions.map(q => ({id:q.id, selected:['暂不保存'], custom:''}))};
+    },
+  });
+  assert.equal(rejectedMethod.status, 'cancelled');
+  assert.equal(rejectedMethod.learning.status, 'not_saved');
+  assert.equal(methodCards, 1);
+  assert.equal(rejectedMethod.execution_summary.generated_files, 0);
   const first = await runOfficeFill(args, ports);
   assert.equal(first.status, 'completed', JSON.stringify(first));
   assert.equal(first.results.length, 1);
   assert.ok(cards > 0);
   assert.equal(first.timing.cancelled_waits, 1);
-  assert.equal(first.timing.stages.user_confirmation_wait.count, 2);
+  assert.equal(first.timing.stages.user_confirmation_wait.count, 3);
   assert.ok(first.timing.stages.user_confirmation_wait.seconds >= 0.02);
   const originalCards = cards;
   const second = await runOfficeFill({work, task_id: first.task_id}, ports);
@@ -67,6 +83,7 @@ try {
   assert.ok(readBack.stdout.includes('987654321'));
   console.log(JSON.stringify({passed: true, nativeAskInterfaceSimulated: true,
     pythonWorkerReal: true, firstQuestions: originalCards, resumeQuestions: 0,
+    methodDeclineStopsOldQuestions: true,
     changedSourceQuestions: cards-originalCards, sameBatchNewValueVerified:true,
     cancelledWaitRecorded: true, resumedWaitNotDoubleCounted: true}));
 } finally {

@@ -86,8 +86,11 @@ def response(work, task, execution_summary=None):
         result['success_with_rejected'] = True
     if task.get('learning'):
         result['learning'] = task['learning']
-        if task['learning'].get('status') == 'needs_refresh':
-            result['next_action'] = task['learning']['next_action']
+        if task['learning'].get('status') in ('needs_refresh', 'not_saved'):
+            result['next_action'] = task['learning'].get(
+                'next_action',
+                '本次方法未保存，原任务和已有资料均保留。请使用同一 task_id 恢复原任务，'
+                '或使用同一 task_id 再次提出修订后的方法。')
     if needs_mapping:
         result.update(mapping_view.initial(task))
     if task.get('failed_stage') == 'source' and task['status'] == 'failed':
@@ -635,11 +638,16 @@ def dispatch(data):
                     if action == 'resume' and not changed and review.validate(task.get('questions', []), data.get('answers', [])):
                         if previous_status == 'awaiting_method':
                             learning.confirm(store, work, task, data['answers'])
+                            # “暂不保存” cancels this method-confirmation call.
+                            # A later status/propose explicitly resumes the
+                            # preserved task; do not auto-advance into its old
+                            # source questions or generation here.
                         elif previous_status == 'awaiting_source':
                             source.save_answers(store, task, data['answers'])
                         else:
                             review.save(task, data['answers'])
-                        advance(store, work, task)
+                        if task['status'] != 'cancelled':
+                            advance(store, work, task)
                     elif action == 'status' and not task.get('questions'):
                         with timing.measure(task, 'generation_and_check'):
                             execute_documents(store, work, task)

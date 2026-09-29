@@ -120,7 +120,16 @@ def confirm(store, work, task, answers):
     pending = task['pending_method']
     if any(a.get('selected') != ['确认保存'] or a.get('custom') for a in answers):
         task.pop('pending_method')
-        task['learning'] = {'status': 'not_saved'}
+        task['learning'] = {
+            'status': 'not_saved',
+            'next_action': '本次方法未保存，原任务和已有资料均保留。要修订方法请使用同一 task_id 再次提出方法；'
+                           '要继续原任务请使用同一 task_id 恢复，当前不会重复弹出旧来源问题。',
+        }
+        # This is a cancellation of the save-method request, not an answer to
+        # the source questions that were visible before proposing it.  Keep the
+        # task and its evidence intact, but make this resume call terminal so
+        # runner does not immediately reopen those old questions.
+        task.update(status='cancelled', questions=[])
         return
     try:
         item = snapshot(store, work, task, pending['proposal'])

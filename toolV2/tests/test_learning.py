@@ -68,6 +68,17 @@ class LearningWorkflowTests(unittest.TestCase):
         self.assertEqual("source", result["failed_stage"])
         return result
 
+    def start_awaiting_source(self, batch: str = "20260929-03") -> dict:
+        document = Document()
+        document.add_paragraph("用途：流动资金")
+        document.save(self.source)
+        result = request({"action": "start", "work": str(self.work),
+                          "source": [self.source.name], "targets": [self.target.name], "batch": batch})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual("awaiting_source", result["status"])
+        self.assertTrue(result["questions"])
+        return result
+
     def updates(self, value: str = "流动资金") -> list[dict]:
         return [{"source": self.source.name, "source_sha256": sha256_file(self.source), "rows": [{
             "key": "用途", "value": value, "evidence": {"paragraph_index": 0},
@@ -99,6 +110,18 @@ class LearningWorkflowTests(unittest.TestCase):
         connection = sqlite3.connect(self.work / "db" / "workflow.db")
         try:
             return connection.execute("SELECT COUNT(*) FROM fact").fetchone()[0]
+        finally:
+            connection.close()
+
+    def write_legacy_not_saved_task(self, task_id: str) -> None:
+        connection = sqlite3.connect(self.work / "db" / "workflow.db")
+        try:
+            encoded = connection.execute("SELECT payload FROM office_v2_task WHERE id=?", (task_id,)).fetchone()[0]
+            task = json.loads(encoded)
+            task.update(status="cancelled", questions=[], learning={"status": "not_saved"})
+            connection.execute("UPDATE office_v2_task SET payload=? WHERE id=?",
+                               (json.dumps(task, ensure_ascii=False), task_id))
+            connection.commit()
         finally:
             connection.close()
 
@@ -160,6 +183,16 @@ class LearningWorkflowTests(unittest.TestCase):
         self.assertTrue(applied["ok"], applied)
         self.assertEqual(repeated["counters"]["source_imports"], applied["counters"]["source_imports"])
 
+    def test_legacy_not_saved_snapshot_without_next_action_can_resume(self) -> None:
+        started = self.start_awaiting_source(batch="20260929-04")
+        self.write_legacy_not_saved_task(started["task_id"])
+
+        restored = request({"action": "status", "work": str(self.work), "task_id": started["task_id"]})
+        self.assertTrue(restored["ok"], restored)
+        self.assertEqual("awaiting_source", restored["status"])
+        self.assertTrue(restored["questions"])
+        self.assertIn("同一 task_id", restored["next_action"])
+
     def test_script_change_during_confirmation_rejects_the_pending_method(self) -> None:
         failed = self.start_failed()
         script = self.work / "recognise.py"
@@ -174,10 +207,38 @@ class LearningWorkflowTests(unittest.TestCase):
     def test_not_saved_method_does_not_write_facts_or_method_record(self) -> None:
         failed = self.start_failed()
         cancelled = self.confirm(self.propose(failed["task_id"]), selected="暂不保存")
-        self.assertEqual("failed", cancelled["status"])
+        self.assertEqual("cancelled", cancelled["status"])
         self.assertEqual("not_saved", cancelled["learning"]["status"])
+        self.assertIn("原任务", cancelled["next_action"])
         self.assertEqual(0, self.fact_count())
         self.assertEqual([], self.method_list(failed["task_id"]))
+
+    def test_not_saved_method_cancels_this_call_without_reopening_existing_source_questions(self) -> None:
+        started = self.start_awaiting_source()
+        cancelled = self.confirm(self.propose(started["task_id"]), selected="暂不保存")
+        self.assertTrue(cancelled["ok"], cancelled)
+        self.assertEqual("cancelled", cancelled["status"])
+        self.assertEqual("not_saved", cancelled["learning"]["status"])
+        self.assertEqual([], cancelled["questions"])
+        self.assertIn("原任务", cancelled["next_action"])
+        self.assertEqual(0, cancelled["execution_summary"]["generated_files"])
+        self.assertEqual(0, self.fact_count())
+        self.assertEqual([], self.method_list(started["task_id"]))
+
+        # A normal status call restores the preserved source workflow instead
+        # of treating the transient method cancellation as a permanent block.
+        restored = request({"action": "status", "work": str(self.work), "task_id": started["task_id"]})
+        self.assertEqual("awaiting_source", restored["status"])
+        self.assertTrue(restored["questions"])
+        self.assertEqual(0, restored["execution_summary"]["generated_files"])
+
+        # A corrected method can still be proposed and confirmed on this task.
+        revised = self.propose(started["task_id"], name="修订后的合成用途识别")
+        self.assertEqual("awaiting_method", revised["status"])
+        confirmed = self.confirm(revised)
+        self.assertTrue(confirmed["ok"], confirmed)
+        self.assertEqual("completed", confirmed["status"])
+        self.assertEqual(1, self.fact_count())
 
     def test_apply_rejects_old_evidence_after_source_changes(self) -> None:
         failed = self.start_failed()
