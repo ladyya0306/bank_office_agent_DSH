@@ -14,7 +14,9 @@ from . import source_conflicts
 # v7: a directly declared natural-person guarantor owns the immediately
 # following certificate as well; source-question headings include that
 # declared role/name when a question still remains.
-SOURCE_PARSE_VERSION = 8
+# v9: DOCX source tables retain merged-cell identity instead of pairing the
+# flattened grid; old false label/value candidates must not survive in cache.
+SOURCE_PARSE_VERSION = 9
 # Parser refresh must not erase unchanged user decisions. Evidence/ownership
 # changes already produce different identities; retain the prior answer schema.
 SOURCE_ANSWER_VERSION = 3

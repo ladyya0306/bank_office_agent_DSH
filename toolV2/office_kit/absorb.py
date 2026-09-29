@@ -166,6 +166,90 @@ def _xlsx_is_header_label(text: str) -> bool:
             label.startswith("备注"))
 
 
+def _docx_table_lines(table) -> list[str]:
+    """Return source lines from a Word table without inventing merged-cell pairs.
+
+    ``python-docx`` exposes a visual grid: a horizontally merged cell appears in
+    each covered column and a vertically merged cell appears again in later
+    rows.  The old reader only retained that grid, so ``标签、标签、值`` could
+    become ``标签：标签`` and then ``值：下一个标签``.  Keep the cell identity
+    long enough to collapse horizontal repeats and identify vertical continuations.
+
+    A table is not necessarily a form.  Pair cells only when neither cell is
+    part of a vertical merge and the row gives an explicit enough form signal:
+    a known field-shaped label or a label ending in a colon.  An unknown
+    two-column row might be a table header, so its cells remain readable for a
+    later script or human review instead of becoming an invented fact.
+    """
+    rows = list(table.rows)
+    grid = [[(cell, cell.text.strip()) for cell in row.cells] for row in rows]
+    occurrences: dict[int, set[int]] = {}
+    for row_index, row in enumerate(grid):
+        for cell, _text in row:
+            occurrences.setdefault(id(cell._tc), set()).add(row_index)
+
+    lines: list[str] = []
+    for row in grid:
+        # Collapse only adjacent references to the same XML cell.  They are the
+        # repeated columns introduced by a horizontal merge.
+        cells: list[tuple[str, bool]] = []
+        previous_cell_id: int | None = None
+        for cell, text in row:
+            cell_id = id(cell._tc)
+            vertical = len(occurrences[cell_id]) > 1
+            if cell_id == previous_cell_id:
+                continue
+            cells.append((text, vertical))
+            previous_cell_id = cell_id
+
+        index = 0
+        while index < len(cells):
+            text, vertical = cells[index]
+            if not text:
+                index += 1
+                continue
+            if LINE_RE.match(text):
+                lines.append(text)
+                index += 1
+                continue
+            right = cells[index + 1] if index + 1 < len(cells) else None
+            if right is not None:
+                value, value_is_vertical = right
+                label = text.rstrip("：: ").strip()
+                explicit_label = text.rstrip().endswith(("：", ":"))
+                if (label and value and not vertical and not value_is_vertical and
+                        label != value and
+                        (_xlsx_looks_like_label(label) or explicit_label) and
+                        not LINE_RE.match(value) and not _xlsx_is_header_label(value)):
+                    lines.append("%s：%s" % (label, value))
+                    index += 2
+                    continue
+            lines.append(text)
+            index += 1
+    return lines
+
+
+def _read_docx_lines(path: Path) -> list[str]:
+    """Read DOCX body blocks in document order while retaining table structure."""
+    import docx
+
+    document = docx.Document(str(path))
+    paragraphs = {paragraph._element: paragraph for paragraph in document.paragraphs}
+    tables = {table._element: table for table in document.tables}
+    lines: list[str] = []
+    for child in document.element.body.iterchildren():
+        paragraph = paragraphs.get(child)
+        if paragraph is not None:
+            text = paragraph.text.strip()
+            if text:
+                lines.append(text)
+            continue
+        table = tables.get(child)
+        if table is not None:
+            lines.extend(_docx_table_lines(table))
+    return lines
+
+
 def read_lines(path: Path) -> list[tuple[int, str]]:
     """把材料读成 `(行号, 文字)`。**行号是唯一的"出处"**，绝不能丢。
 
@@ -175,26 +259,7 @@ def read_lines(path: Path) -> list[tuple[int, str]]:
     suffix = path.suffix.lower()
     lines: list[tuple[int, str]] = []
     if suffix == ".docx":
-        data = doc_read.read_docx(path)
-        for block in data["blocks"]:
-            if block["type"] in ("paragraph", "list_item"):
-                text = str(block.get("text") or "").strip()
-                if text:
-                    lines.append((len(lines), text))
-            elif block["type"] == "table":
-                for row in ([block.get("header")] if block.get("header") else []) + \
-                        list(block.get("data") or []):
-                    cells = [str(c or "").strip() for c in row]
-                    i = 0
-                    while i < len(cells):
-                        label = cells[i].rstrip("：: ")
-                        if label and i + 1 < len(cells) and cells[i + 1]:
-                            lines.append((len(lines), "%s：%s" % (label, cells[i + 1])))
-                            i += 2
-                        else:
-                            if cells[i]:
-                                lines.append((len(lines), cells[i]))
-                            i += 1
+        lines.extend((index, text) for index, text in enumerate(_read_docx_lines(path)))
     elif suffix in (".xlsx", ".xlsm"):
         # ``read_workbook`` is intentionally table-oriented: it finds a likely
         # header and previews rows below it.  A completed horizontal form can
