@@ -15,6 +15,7 @@
 
 | 问题或需求 | 优先阅读 |
 |---|---|
+| 临时脚本识别结果、用户确认、保存复用 | `workflow/learning.py`、`workflow/source_evidence.py`；[说明](../release-docs/已确认脚本与填写方法.md) |
 | 来源识别、主体归属 | `workflow/source.py`、`office_kit/absorb.py`、`office_kit/fact_catalog.py` |
 | 来源冲突 | `workflow/source_conflicts.py` |
 | 模板空位、字段对应、文件名角色 | `office_kit/template_slots.py`、`workflow/mapping.py`、`office_kit/target_validation.py` |

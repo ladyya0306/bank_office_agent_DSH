@@ -13,7 +13,7 @@ from office_kit.workroot import init_workroot, is_workroot
 from office_kit.cli import build_parser, _dispatch
 from office_kit.harness import build_fill_plan, current_docx_target_errors, current_xlsx_gaps
 from office_kit.target_validation import template_read_cache
-from . import storage as state, source, review, mapping, mapping_view, timing
+from . import storage as state, source, review, mapping, mapping_view, timing, learning
 
 ROOT = Path(__file__).resolve().parents[1]
 WorkflowError = ValueError
@@ -42,7 +42,10 @@ def response(work, task, execution_summary=None):
         result = {k: record[k] for k in ('status', 'error', 'filled', 'failed', 'coverage', 'blank_slots') if k in record}
         result['template'] = name
         if record.get('output') and record.get('status') == 'completed':
-            result['output'] = str(work / record['output'])
+            if task.get('source_ready'):
+                result['output'] = str(work / record['output'])
+            else:
+                result.update(previous_output=str(work / record['output']), status='waiting_source')
         results.append(result)
     needs_mapping = task['status'] == 'needs_mapping'
     if needs_mapping:
@@ -61,6 +64,7 @@ def response(work, task, execution_summary=None):
             'timing': timing.summary(task),
             'report': str(work / task['report']) if task.get('report') and task['status'] in ('completed', 'partial') else None,
             'mapping_requests': [], 'available_fields': [],
+            'registered_templates': len(task['targets']),
             'mapping_revision': mapping_view.revision(task),
             'unsigned': True, 'note': ('部分源材料尚未解析，请查看 issues 中的文件和原文；已生成文件仅包含已处理内容。'
                                      if task.get('source_issues') else '')
@@ -80,9 +84,22 @@ def response(work, task, execution_summary=None):
         # success.
         result['ok'] = False
         result['success_with_rejected'] = True
+    if task.get('learning'):
+        result['learning'] = task['learning']
+        if task['learning'].get('status') == 'needs_refresh':
+            result['next_action'] = task['learning']['next_action']
     if needs_mapping:
         result.update(mapping_view.initial(task))
-    if task.get('delivery') and not needs_mapping:
+    if task.get('failed_stage') == 'source' and task['status'] == 'failed':
+        for item in results:
+            if 'output' in item:
+                item['previous_output'] = item.pop('output')
+                item['status'] = 'waiting_source'
+        result.update(failed_stage='source', error='来源解析尚未得到可用字段；目标模板尚未进入填写规划，并非没有目标模板。',
+                      next_action='用 mapping_read.source_document+source 读取来源原文，learning.propose 提交带证据的识别结果；确认后自动继续原 task_id。不要重复读取空的位置页。',
+                      source_reads=[{'section': 'source_document', 'source': name} for name in task['source']],
+                      mapping_pages={'templates': mapping_view.page(task, {'section': 'templates'})})
+    if task.get('delivery') and task['status'] in ('completed', 'partial'):
         result['delivery'] = task['delivery']
     if execution_summary is not None:
         result['execution_summary'] = execution_summary
@@ -97,6 +114,8 @@ def response(work, task, execution_summary=None):
 def execution_summary(before, task):
     """Describe only this dispatch call; never persist or scan directories."""
     generated, reused = [], []
+    if task.get('source_ready') is False:
+        return {'generated_files': 0, 'reused_files': 0, 'generated_templates': []}
     for name, record in task.get('documents', {}).items():
         old = before.get('documents', {}).get(name, {})
         if record.get('status') != 'completed' or not record.get('output'):
@@ -374,6 +393,10 @@ def prepare_documents(store, work, task):
 
 
 def advance(store, work, task, *, execute=True):
+    if task.get('pending_method'):
+        learning.questions(task)
+        save(store, task)
+        return
     with timing.measure(task, 'source_parse_and_check'):
         questions = source.prepare(store, work, task)
     if questions:
@@ -404,6 +427,8 @@ def advance(store, work, task, *, execute=True):
 
 
 def execute_documents(store, work, task):
+    if task.get('source_ready') is False:
+        return
     if any(r.get('status') == 'needs_mapping' for r in task['documents'].values()):
         task.update(status='needs_mapping', questions=[])
         return
@@ -583,7 +608,24 @@ def dispatch(data):
                 started = timing.begin(task, data.get('user_wait'))
                 if action == 'record_wait':
                     pass
+                elif action == 'learning':
+                    query = data.get('learning') or {}
+                    if query.get('action') in ('list', 'read'):
+                        return {'ok': True, 'status': 'method_ready', 'task_id': task['id'],
+                                'work': str(work), 'learning': learning.read(store, work, query)}
+                    if query.get('action') == 'propose':
+                        learning.propose(store, work, task, query)
+                    elif query.get('action') == 'apply':
+                        if task.get('pending_method'):
+                            raise ValueError('请先完成或取消当前方法确认，再复用其他方法')
+                        learning.apply_method(store, work, task, query)
+                    else:
+                        raise ValueError('learning.action 需要 propose、list、read 或 apply')
+                    if task.get('learning', {}).get('status') != 'needs_refresh':
+                        advance(store, work, task)
                 elif action == 'update_positions':
+                    if task.get('pending_method'):
+                        raise ValueError('请先完成或取消当前方法确认，再更新位置')
                     update_positions(store, work, task, data.get('updates'))
                 elif action in ('status', 'resume'):
                     previous_questions = task.get('questions', [])
@@ -591,7 +633,9 @@ def dispatch(data):
                     advance(store, work, task, execute=False)
                     changed = state.digest(previous_questions) != state.digest(task.get('questions', []))
                     if action == 'resume' and not changed and review.validate(task.get('questions', []), data.get('answers', [])):
-                        if previous_status == 'awaiting_source':
+                        if previous_status == 'awaiting_method':
+                            learning.confirm(store, work, task, data['answers'])
+                        elif previous_status == 'awaiting_source':
                             source.save_answers(store, task, data['answers'])
                         else:
                             review.save(task, data['answers'])

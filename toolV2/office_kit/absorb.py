@@ -41,14 +41,14 @@ LINE_RE = re.compile(r"^\s*([\u4e00-\u9fffA-Za-z0-9（）()、·*]{1,24})\s*[:�
 #: 这一行在说"谁是借款人/保证人/法定代表人"
 SUBJECT_WORDS = {
     "借款人名称": "借款人", "保证人名称": "保证人",
-    "借款人": "借款人", "客户": "借款人", "申请人": "借款人", "授信申请人": "借款人",
+    "借款人": "借款人", "客户": "借款人", "客户名称": "借款人", "申请人": "借款人", "授信申请人": "借款人",
     "用信人": "借款人",
     "保证人": "保证人", "担保人": "保证人", "保证方": "保证人",
     "法定代表人": "法定代表人", "法人代表": "法定代表人", "法人": "法定代表人",
 }
 #: 标签 → 标准键名（**只放我们有把握的**；其余照抄标签并标 ⚠️）
 LABEL_ALIASES = {
-    "借款人": "借款人名称", "客户": "借款人名称", "申请人": "借款人名称",
+    "借款人": "借款人名称", "客户": "借款人名称", "客户名称": "借款人名称", "申请人": "借款人名称",
     "授信申请人": "借款人名称", "用信人": "借款人名称",
     "保证人": "保证人名称", "担保人": "保证人名称", "保证方": "保证人名称",
     "统一社会信用代码": "统一社会信用代码", "行内编号": "行内编号",
@@ -61,6 +61,7 @@ LABEL_ALIASES = {
     "证件号码": "证件号码", "证件号": "证件号码",
     "开户行及账号": "开户行及账号", "开户银行及账号": "开户行及账号",
     "保证金额": "保证金额", "保证期限": "保证期限", "期限": "期限",
+    "授信额度": "授信额度", "额度": "额度", "已使用额度": "已使用额度",
 }
 #: 这些标签的**值本身是一个主体名**（不是普通字段）
 SUBJECT_LABELS = {"借款人名称", "保证人名称", "借款人法定代表人", "保证人法定代表人",
@@ -142,6 +143,29 @@ def _narrative_issue(line: int, text: str) -> dict[str, Any] | None:
     }
 
 
+_XLSX_LABEL_ENDINGS = ("名称", "姓名", "代码", "编号", "号码", "证件", "账号", "账户", "额度",
+                       "电话", "地址", "金额", "期限", "用途", "日期", "时间", "利率",
+                       "银行", "机构", "类型", "种类", "状态", "等级", "类别", "项目")
+
+
+def _xlsx_looks_like_label(text: str) -> bool:
+    """Identify a likely label without treating every table header as a value."""
+    label = text.rstrip("：: ").strip()
+    return (label in LABEL_ALIASES or label in SUBJECT_WORDS or
+            label in CERTIFICATE_NUMBER_LABELS or label in CERTIFICATE_TYPE_LABELS or
+            label.endswith(_XLSX_LABEL_ENDINGS))
+
+
+def _xlsx_is_header_label(text: str) -> bool:
+    """Return true only for field-like text that cannot be an ordinary value."""
+    label = text.rstrip("：: ").strip()
+    return (label in LABEL_ALIASES or label in SUBJECT_WORDS or
+            label in CERTIFICATE_NUMBER_LABELS or label in CERTIFICATE_TYPE_LABELS or
+            label.endswith(("金额", "期限", "额度", "日期", "时间", "利率", "号码", "代码", "编号",
+                            "保证金", "类别", "备注")) or
+            label.startswith("备注"))
+
+
 def read_lines(path: Path) -> list[tuple[int, str]]:
     """把材料读成 `(行号, 文字)`。**行号是唯一的"出处"**，绝不能丢。
 
@@ -171,7 +195,57 @@ def read_lines(path: Path) -> list[tuple[int, str]]:
                             if cells[i]:
                                 lines.append((len(lines), cells[i]))
                             i += 1
-    elif suffix in (".xlsx", ".xlsm", ".xls"):
+    elif suffix in (".xlsx", ".xlsm"):
+        # ``read_workbook`` is intentionally table-oriented: it finds a likely
+        # header and previews rows below it.  A completed horizontal form can
+        # put every answer *above* that header, so use its physical rows here.
+        # Merged cells expose their value only at the top-left anchor, which is
+        # exactly the displayed label/value order we need to retain.
+        import openpyxl
+
+        workbook = openpyxl.load_workbook(str(path), read_only=False, data_only=True)
+        try:
+            for sheet in workbook.worksheets:
+                merged_ends = {(item.min_row, item.min_col): item.max_col
+                               for item in sheet.merged_cells.ranges
+                               if item.min_row == item.max_row}
+                for row in sheet.iter_rows():
+                    cells = [(str(cell.value).strip(), cell.column,
+                              merged_ends.get((cell.row, cell.column), cell.column))
+                             for cell in row
+                             if cell.value is not None and str(cell.value).strip()]
+                    index = 0
+                    while index < len(cells):
+                        text, column, end_column = cells[index]
+                        # A cell that already says ``标签：值`` is complete
+                        # evidence.  Never consume its right-hand neighbour.
+                        if LINE_RE.match(text):
+                            lines.append((len(lines), text))
+                            index += 1
+                            continue
+                        label = text.rstrip("：: ")
+                        right = cells[index + 1] if index + 1 < len(cells) else None
+                        if right is None:
+                            lines.append((len(lines), text))
+                            index += 1
+                            continue
+                        value, value_column, _value_end = right
+                        adjacent = value_column == end_column + 1
+                        value_is_inline = bool(LINE_RE.match(value))
+                        semantic_pair = (_xlsx_looks_like_label(label) and
+                                         not _xlsx_is_header_label(value))
+                        if (label and value and len(label) <= 24 and adjacent and
+                                not value_is_inline and semantic_pair):
+                            lines.append((len(lines), "%s：%s" % (label, value)))
+                            index += 2
+                        else:
+                            lines.append((len(lines), text))
+                            index += 1
+        finally:
+            workbook.close()
+    elif suffix == ".xls":
+        # ``openpyxl`` does not support the legacy binary format.  Keep the
+        # existing reader for it rather than broadening this change's scope.
         for block in doc_read.read_workbook(path)["sheets"]:
             header = block.get("header") or []
             for row in block.get("preview") or []:

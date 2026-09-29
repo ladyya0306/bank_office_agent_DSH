@@ -1,4 +1,4 @@
-"""Small, repeatable pages from the existing task; never parse documents here."""
+"""Bounded task views, including read-only original documents for recovery."""
 import json
 import re
 from pathlib import Path
@@ -154,6 +154,12 @@ def page(task, query):
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise ValueError('分页 offset 必须为非负整数')
     version = revision(task)
+    if section == 'source_document':
+        from office_kit.store_v2 import sha256_file
+        name = query.get('source')
+        if name not in task.get('source', []):
+            raise ValueError('只能读取本任务登记的来源')
+        version = digest([version, name, sha256_file(inside(Path(task['last_work']), name))])
     if query.get('revision') and query['revision'] != version:
         raise ValueError('来源或位置已经变化，请重新读取第一页；未修改位置')
     names = [n for n, r in task.get('documents', {}).items() if r.get('status') == 'needs_mapping']
@@ -161,6 +167,14 @@ def page(task, query):
     record = task.get('documents', {}).get(template)
     if section == 'fields':
         items = [shorten(f, {'section': 'source_details', 'field': f['field']}) for f in facts(task)]
+    elif section == 'source_document':
+        from .source_evidence import document_items
+        items = []
+        for original in document_items(Path(task['last_work']), task, query.get('source')):
+            position = {key: value for key, value in original.items() if key != 'text'}
+            for fragment in chunks(original['text'], {}):
+                fragment['segment'] = fragment.pop('part')
+                items.append({**position, **fragment})
     elif section == 'source':
         seen, items = set(), []
         for row in task.get('rows', []):
@@ -178,16 +192,22 @@ def page(task, query):
             raise ValueError('找不到该来源字段')
         items = list(chunks(match, {'field': match['field']}))
     elif section == 'templates':
-        items = [{'template': n, 'status': r.get('status'), 'positions': len(r.get('unmapped_slots', [])),
-                  'current_positions': len(r.get('current_positions', []))}
-                 for n, r in task.get('documents', {}).items()]
+        items = []
+        for name in task.get('targets', list(task.get('documents', {}))):
+            record = task.get('documents', {}).get(name)
+            items.append({'template': name, 'status': record.get('status') if record else 'not_parsed',
+                          'positions': len(record.get('unmapped_slots', [])) if record else None,
+                          'current_positions': len(record.get('current_positions', [])) if record else None})
     elif section == 'issues':
         items = list(chunks(task.get('issues', []), {}))
     elif section in ('positions', 'current_positions', 'context', 'document', 'output'):
         if section in ('document', 'output') and not template:
             raise ValueError('读取完整模板需要指定本任务的 template')
         if record is None and template is not None:
-            raise ValueError('只能读取本任务的模板')
+            if template not in task.get('targets', []):
+                raise ValueError('只能读取本任务的模板；请使用 templates 页列出的完整路径')
+            if section != 'document':
+                raise ValueError('该模板属于本任务，但尚未建立填写位置；请先处理来源解析问题。正文可用 document 页读取。')
         record = record or {}
         if section == 'positions':
             workbook_cache = {}
@@ -239,6 +259,10 @@ def page(task, query):
     result = {'section': section, 'template': template if section in ('positions', 'current_positions', 'context', 'document', 'output') else None,
             'offset': offset, 'total': len(items), 'items': selected, 'revision': version,
             'next': {**base, 'offset': next_offset} if next_offset < len(items) else None}
+    if section == 'source_document':
+        from office_kit.store_v2 import sha256_file
+        result['source'] = query['source']
+        result['source_sha256'] = sha256_file(inside(Path(task['last_work']), query['source']))
     if section == 'output' and 'output_path' in locals() and output_path is not None:
         result['output'] = str(output_path)
     if section == 'positions':

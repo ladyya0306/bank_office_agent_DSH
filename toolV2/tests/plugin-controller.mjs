@@ -264,3 +264,36 @@ test('preserves an existing task id when the initial status call fails', async (
   assert.match(result.error, /状态读取失败/);
   assert.match(result.error, /task_id 恢复/);
 });
+
+test('method proposals obtain native answers and cannot provide their own approval', async () => {
+  const calls = [];
+  const result = await runOfficeFill({ work: 'work', task_id: 'task-1',
+    learning: { action: 'propose', name: '合成方法', script_path: 'read.py' } }, {
+    run: async (payload) => {
+      calls.push(payload);
+      if (payload.action === 'learning') {
+        const value = pending('awaiting_method', 'method-1');
+        value.questions[0].options = [{ label: '确认保存', description: '保存合成方法' }];
+        return value;
+      }
+      assert.deepEqual(payload.answers, [{ id: 'method-1', selected: ['确认保存'], custom: '' }]);
+      return { ok: true, status: 'needs_mapping', task_id: 'task-1' };
+    },
+    ask: async () => ({ answers: [{ id: 'method-1', selected: ['确认保存'] }] }),
+  });
+  assert.equal(result.status, 'needs_mapping');
+  assert.deepEqual(calls.map(x => x.action), ['learning', 'resume']);
+  await assert.rejects(() => runOfficeFill({ work: 'work', learning: {action:'propose'} }, {}), /task_id/);
+  await assert.rejects(() => runOfficeFill({ work: 'work', task_id:'task-1',
+    learning: {action:'propose'}, rule_updates: [] }, {}), /不能/);
+});
+
+test('method cancellation preserves task and never sends approval', async () => {
+  const calls=[];
+  const result = await runOfficeFill({ work:'work',task_id:'task-1',learning:{action:'propose',name:'合成'} }, {
+    run: async payload => { calls.push(payload); return pending('awaiting_method'); },
+    ask: async () => ({cancelled:true}),
+  });
+  assert.equal(result.status,'cancelled');
+  assert.ok(!calls.some(p=>p.action==='resume'));
+});

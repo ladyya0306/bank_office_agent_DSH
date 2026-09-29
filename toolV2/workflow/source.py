@@ -14,7 +14,7 @@ from . import source_conflicts
 # v7: a directly declared natural-person guarantor owns the immediately
 # following certificate as well; source-question headings include that
 # declared role/name when a question still remains.
-SOURCE_PARSE_VERSION = 7
+SOURCE_PARSE_VERSION = 8
 # Parser refresh must not erase unchanged user decisions. Evidence/ownership
 # changes already produce different identities; retain the prior answer schema.
 SOURCE_ANSWER_VERSION = 3
@@ -22,7 +22,11 @@ SOURCE_ANSWER_VERSION = 3
 
 def prepare(store, work, task):
     signatures = [(p, sha256_file(inside(work, p))) for p in task['source']]
-    signature = digest([SOURCE_PARSE_VERSION, signatures])
+    from .learning import override_key
+    confirmed = {name: get(store.conn, 'office_v2_cache', override_key(name, fingerprint))
+                 for name, fingerprint in signatures}
+    methods = [(name, value['method_id']) for name, value in confirmed.items() if value]
+    signature = digest([SOURCE_PARSE_VERSION, signatures, methods]) if methods else digest([SOURCE_PARSE_VERSION, signatures])
     task['source_content_signature'] = digest(signatures)
     task['equivalent_source_signatures'] = [digest([version, signatures])
                                             for version in range(1, SOURCE_PARSE_VERSION + 1)]
@@ -32,7 +36,7 @@ def prepare(store, work, task):
     diagnostics = []
     for name, fingerprint in signatures:
         cache_id = 'source:' + digest([SOURCE_PARSE_VERSION, name, fingerprint])
-        cached = get(store.conn, 'office_v2_cache', cache_id)
+        cached = confirmed[name] or get(store.conn, 'office_v2_cache', cache_id)
         if cached is None:
             parsed, issues = absorb.absorb_with_diagnostics(inside(work, name))
             cached = {'rows': parsed, 'issues': issues}
@@ -47,9 +51,12 @@ def prepare(store, work, task):
     task['rows'] = rows
     if not rows:
         task['source_ready'] = False
+        task['available_fields'] = []
         task['issues'] = diagnostics or [{'stage': 'source', 'reason': '源文件未识别出键值，请补充材料或针对源解析修复；未猜测填写。'}]
-        task['status'] = 'needs_mapping'
+        task['status'] = 'failed'
+        task['failed_stage'] = 'source'
         return []
+    task.pop('failed_stage', None)
     task['rows'] = rows
     task['source_signature'] = signature
     task['source_ready'] = False

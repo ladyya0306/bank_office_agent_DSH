@@ -197,11 +197,14 @@ class MaterialVariantTests(unittest.TestCase):
         self.assertEqual("合成借款公司", row["entity_name"])
         self.assertIn("贷款合同", row["context"])
 
-    def test_pure_narrative_material_returns_needs_mapping_not_completed(self) -> None:
+    def test_pure_narrative_material_reports_source_failure_not_empty_mapping(self) -> None:
         source = self.doc("narrative-only.docx", "本合同由合成甲方与合成乙方于合成地点签订。")
         target = self.doc("target.docx", "联系电话：")
         result = self.start([source], target)
-        self.assertEqual("needs_mapping", result["status"], result)
+        self.assertEqual("failed", result["status"], result)
+        self.assertEqual("source", result["failed_stage"])
+        self.assertEqual(1, result["mapping_pages"]["templates"]["total"])
+        self.assertIsNone(result["mapping_pages"]["templates"]["items"][0]["positions"])
         self.assertIn("未识别出键值", result["issues"][0]["reason"])
         self.assertFalse(result["results"])
 

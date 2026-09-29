@@ -155,7 +155,8 @@ export function apply(ctx, config = {}) {
       batch: { type: 'string', description: '通常省略，程序优先继续相同源文件和目标文件的原任务。仅用户明确指定业务批次时填写 YYYYMMDD-NN，不得自行编造日期或用任务描述代替批次。' },
       task_id: { type: 'string', description: '恢复已有任务时提供；工具会查状态并在需要时继续询问' },
       mapping_read: { type: 'object', additionalProperties: false, properties: {
-        section: { type: 'string', enum: ['fields', 'source', 'document', 'output', 'templates', 'positions', 'current_positions', 'source_details', 'context', 'issues'] },
+        section: { type: 'string', enum: ['fields', 'source', 'source_document', 'document', 'output', 'templates', 'positions', 'current_positions', 'source_details', 'context', 'issues'] },
+        source: { type: 'string' },
         template: { type: 'string' }, offset: { type: 'integer' }, revision: { type: 'string' },
         field: { type: 'string' }, slot_id: { type: 'string' },
       }, description: '读取原任务的来源、模板、当前产物或位置页，必须同传task_id。positions仅列尚未关联的空位，已关联项用current_positions；完整模板用document+template，核验当前产物用output+template，无需解压脚本。续页原样传返回的next。只读，不重新填报或弹窗。不能与rule_updates同传。' },
@@ -173,10 +174,29 @@ export function apply(ctx, config = {}) {
           label: { type: 'string' },
           expected_target: { type: 'object', additionalProperties: true, properties: {} },
         } }, description: '仅对 needs_mapping 的 mapping_requests 提交位置映射：template+slot_id+field，或template+slot_id+template_reference复用同模板固定值，或template+slot_id+leave_blank+reason；兼容旧格式template+field+target；必须与task_id同传' },
+      learning: { type: 'object', additionalProperties: false, properties: {
+        action: { type: 'string', required: true, enum: ['propose', 'list', 'read', 'apply'] },
+        id: { type: 'string' }, name: { type: 'string' }, script_path: { type: 'string' },
+        save_target_rules: { type: 'boolean' },
+        source_updates: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
+          source: { type: 'string', required: true }, source_sha256: { type: 'string', required: true },
+          rows: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
+            key: { type: 'string', required: true }, value: { type: 'string', required: true },
+            entity_name: { type: 'string' }, role: { type: 'string' }, derivation: { type: 'string' },
+            evidence: { type: 'object', additionalProperties: false, properties: {
+              sheet: { type: 'string' }, cell: { type: 'string' },
+              paragraph_index: { type: 'integer' }, part: { type: 'string' },
+            } },
+          } } },
+        } } },
+      }, description: '同传task_id。propose把脚本理解的来源结果提交原生确认并保存：name、可选script_path、source_updates；每条以source_document原始位置和sha256为依据，替换指定来源的全部识别结果。value通常取原文，转换或计算须给derivation并由使用者确认。save_target_rules保存当前填写规则。list/read查询已确认方法；apply仅复用相同文件内容，来源改变应重新运行保存脚本后提交新结果。脚本保存在本工作区，执行仍走DSH现有工具，不在office.py内运行。不能与mapping_read/rule_updates同传。' },
     },
     output: { schema: { type: 'object', additionalProperties: true, properties: {} },
       render: (_args, value) => [{ type: 'text', text: renderOfficeOutput(value) }] },
     async execute(args, exec) {
+      if (args.learning && (!args.task_id || args.rule_updates || args.mapping_read)) {
+        throw new Error('learning 需要 task_id，且不能与 mapping_read/rule_updates 同传');
+      }
       if (!args.task_id && (!Array.isArray(args.source) || !Array.isArray(args.targets))) {
         throw new Error('新建填表任务需要 source 和 targets 文件列表');
       }

@@ -95,15 +95,20 @@ function interactionUnavailable(error) {
 
 /** Drive only the fixed office.py JSON protocol; all effects are injected for testing. */
 export async function runOfficeFill(args, { ask, run, signal }) {
+  if (args.learning && (!args.task_id || args.mapping_read || args.rule_updates)) {
+    throw new Error('learning 需要 task_id，且不能与 mapping_read/rule_updates 同传');
+  }
   if (args.mapping_read) {
-    if (!args.task_id || args.rule_updates) throw new Error('mapping_read 需要 task_id，且不能与 rule_updates 同传');
+    if (!args.task_id || args.rule_updates || args.learning) throw new Error('mapping_read 需要 task_id，且不能与 rule_updates/learning 同传');
     return validateEnvelope(await run({ action: 'read_mapping', work: args.work,
       task_id: args.task_id, mapping_read: args.mapping_read }, { signal }));
   }
   let response;
   try {
     response = preserveTaskContext(validateEnvelope(args.task_id
-      ? await run(args.rule_updates
+      ? await run(args.learning
+        ? { action: 'learning', work: args.work, task_id: args.task_id, learning: args.learning }
+        : args.rule_updates
         ? { action: 'update_positions', work: args.work, task_id: args.task_id,
           updates: args.rule_updates }
         : { action: 'status', work: args.work, task_id: args.task_id }, { signal })
@@ -135,7 +140,7 @@ export async function runOfficeFill(args, { ask, run, signal }) {
   }
 
   while (!terminal(response)) {
-    if (!['awaiting_source', 'awaiting_fill'].includes(response.status)) return response;
+    if (!['awaiting_source', 'awaiting_fill', 'awaiting_method'].includes(response.status)) return response;
     const version = questionVersion(response);
     if (askedVersions.has(version)) {
       throw new Error(`任务 ${response.task_id} 在问题未变化时没有推进；可用 task_id 恢复，系统不会重复弹出同一问题`);

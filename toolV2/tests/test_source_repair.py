@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from docx import Document
+from openpyxl import Workbook
 
 TOOL = Path(__file__).resolve().parents[1]
 if str(TOOL) not in sys.path:
@@ -32,6 +33,25 @@ class SourceRepairTests(unittest.TestCase):
     def source(self, *paragraphs: str) -> Path:
         path = Path(self.tmp.name) / "source.docx"
         write_docx(path, *paragraphs)
+        return path
+
+    def xlsx_source(self) -> Path:
+        path = Path(self.tmp.name) / "horizontal-form.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet["A1"] = "借款人"
+        sheet["B1"] = "合成借款企业"
+        sheet.merge_cells("B1:C1")
+        sheet["D1"] = "联系电话"
+        sheet["E1"] = "13800000000"
+        sheet["A2"] = "开户行"
+        sheet.merge_cells("A2:B2")
+        sheet["C2"] = "合成银行"
+        sheet.merge_cells("C2:D2")
+        sheet["E2"] = "收款账号"
+        sheet["F2"] = "622200000001"
+        sheet.merge_cells("F2:H2")
+        book.save(path)
         return path
 
     def test_one_line_known_labels_split_and_retain_full_quote_and_line(self) -> None:
@@ -77,6 +97,79 @@ class SourceRepairTests(unittest.TestCase):
         self.assertEqual([], rows)
         self.assertEqual(text, issues[0]["quote"])
         self.assertIn("超过 80 个字符", issues[0]["reason"])
+
+    def test_xlsx_horizontal_form_reads_merged_label_value_pairs(self) -> None:
+        rows = absorb(self.xlsx_source())
+        self.assertEqual("合成借款企业", next(row["value"] for row in rows
+                                             if row["key"] == "借款人名称"))
+        self.assertEqual("13800000000", next(row["value"] for row in rows
+                                               if row["key"] == "联系电话"))
+        self.assertEqual("合成银行", next(row["value"] for row in rows
+                                          if row["key"] == "开户行"))
+        self.assertEqual("622200000001", next(row["value"] for row in rows
+                                               if row["key"] == "收款账号"))
+
+    def test_xlsx_inline_fields_are_not_joined_with_the_next_cell(self) -> None:
+        path = Path(self.tmp.name) / "inline-fields.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet["A1"] = "借款人：合成借款企业"
+        sheet["B1"] = "联系电话：13800000000"
+        book.save(path)
+        rows = absorb(path)
+        self.assertEqual("合成借款企业", next(row["value"] for row in rows
+                                             if row["key"] == "借款人名称"))
+        self.assertEqual("13800000000", next(row["value"] for row in rows
+                                               if row["key"] == "联系电话"))
+
+    def test_xlsx_header_cells_are_not_unconditionally_paired_as_facts(self) -> None:
+        path = Path(self.tmp.name) / "headers.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet["A1"] = "客户名称"
+        sheet["B1"] = "贷款金额"
+        book.save(path)
+        self.assertEqual([], absorb(path))
+
+    def test_xlsx_unmerged_horizontal_pairs_are_retained_without_header_guessing(self) -> None:
+        path = Path(self.tmp.name) / "unmerged-horizontal-form.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["客户名称", "合成（上海）科技有限公司", "额度", "500万元", "联系电话", "13800000000"])
+        book.save(path)
+        rows = absorb(path)
+        self.assertEqual({("借款人名称", "合成（上海）科技有限公司"), ("额度", "500万元"),
+                          ("联系电话", "13800000000")},
+                         {(row["key"], row["value"]) for row in rows})
+
+    def test_xlsx_table_headers_are_not_values_for_neighbouring_headers(self) -> None:
+        path = Path(self.tmp.name) / "table-headers.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["协议号", "业务类别", "协议生效日期", "协议到期日期",
+                      "业务金额", "当前保证金", "敞口金额", "备注（是否零保证金开票等）"])
+        book.save(path)
+        self.assertEqual([], absorb(path))
+
+    def test_xlsx_customer_name_and_credit_amount_aliases_are_fields(self) -> None:
+        path = Path(self.tmp.name) / "customer-credit.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet["A1"] = "客户名称"
+        sheet["B1"] = "合成客户企业"
+        sheet.merge_cells("B1:C1")
+        sheet["D1"] = "授信额度"
+        sheet["E1"] = "500万元"
+        sheet["F1"] = "已使用额度"
+        sheet["G1"] = "100万元"
+        book.save(path)
+        rows = absorb(path)
+        self.assertEqual("合成客户企业", next(row["value"] for row in rows
+                                             if row["key"] == "借款人名称"))
+        self.assertEqual("500万元", next(row["value"] for row in rows
+                                         if row["key"] == "授信额度"))
+        self.assertEqual("100万元", next(row["value"] for row in rows
+                                         if row["key"] == "已使用额度"))
 
 
 if __name__ == "__main__":
